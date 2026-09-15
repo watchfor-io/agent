@@ -32,6 +32,8 @@ type Facts struct {
 	MemTotal       uint64 `json:"mem_total"`
 	Virtualization string `json:"virtualization,omitempty"`
 	BootTime       int64  `json:"boot_time"`
+	// Routable addresses per interface; loopback and link-local left out.
+	Addresses map[string][]string `json:"addresses,omitempty"`
 }
 
 type Payload struct {

@@ -176,7 +176,8 @@ Rates need two samples, so the first tick after start reports gauges only;
 `once` takes two samples one second apart for the same reason.
 
 Host facts (OS, kernel, CPU model and count, memory, virtualization, boot
-time) travel with the first batch and then once an hour.
+time, routable addresses per interface) travel with the first batch and
+then once an hour.
 
 ## The systemd unit
 
@@ -212,7 +213,8 @@ uses the same directory, so a cron-driven host catches up on its next run.
   "host": { "id": "3f9a…", "name": "web-01", "tags": {"env": "prod"},
             "os": "Ubuntu 24.04.1 LTS", "kernel": "6.8.0-45-generic", "arch": "amd64" },
   "facts": { "cpu_model": "AMD EPYC 7B13", "cpu_cores": 4, "mem_total": 8329273344,
-             "virtualization": "kvm", "boot_time": 1757600000 },
+             "virtualization": "kvm", "boot_time": 1757600000,
+             "addresses": { "eth0": ["10.0.4.7", "2001:db8::7"] } },
   "samples": [
     { "t": 1757836800, "m": "cpu.usage_pct", "v": 12.4 },
     { "t": 1757836800, "m": "disk.used_pct", "v": 71.2, "l": { "mount": "/", "device": "/dev/vda1", "fs": "ext4" } }

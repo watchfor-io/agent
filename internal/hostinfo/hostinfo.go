@@ -57,6 +57,7 @@ func Facts() metric.Facts {
 	if m, err := procfs.ReadMeminfo(); err == nil {
 		f.MemTotal = m["MemTotal"]
 	}
+	f.Addresses = addresses()
 	return f
 }
 
