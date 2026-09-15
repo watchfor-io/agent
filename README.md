@@ -1,5 +1,9 @@
 # watchfor-agent
 
+[![ci](https://github.com/watchfor-io/agent/actions/workflows/ci.yml/badge.svg)](https://github.com/watchfor-io/agent/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/watchfor-io/agent?display_name=tag)](https://github.com/watchfor-io/agent/releases/latest)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Host monitoring agent for [WatchFor](https://watchfor.io). One static
 binary, one YAML file, outbound HTTPS only. It reads `/proc` and `/sys`,
 turns them into a batch of samples every few seconds and pushes the batch
@@ -32,6 +36,79 @@ watchfor-agent run            # daemon, what the systemd unit runs
 
 `check` works without a token and without a config file, so the first
 thing you can do with the binary is see exactly what it would report.
+
+### Verify a release
+
+Every release ships `checksums.txt` and its minisign signature.
+
+```sh
+sha256sum -c --ignore-missing checksums.txt
+minisign -Vm checksums.txt -P RWTUApo01PH7RyjD76wN2Vu7l5sO7Ys5psNQE9I7QYdWVfWSf0CetQje
+```
+
+The install script does both (the signature when `minisign` is on the
+machine). Binaries are static, built from the tag by GoReleaser with
+`CGO_ENABLED=0 -trimpath`, so a build from the same tag on your own machine
+produces the same binary.
+
+### Install by hand
+
+No script, no surprises — four steps:
+
+```sh
+tar -xzf watchfor-agent_<version>_linux_amd64.tar.gz
+sudo install -m 0755 watchfor-agent /usr/local/bin/watchfor-agent
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin --user-group watchfor-agent
+sudo install -d -m 0750 -o root -g watchfor-agent /etc/watchfor-agent
+sudo install -d -m 0700 -o watchfor-agent -g watchfor-agent /var/lib/watchfor-agent
+```
+
+Write the token and the config (the token file must be 0600 and owned by
+the service user):
+
+```sh
+sudo sh -c 'umask 077; printf "%s\n" "<host-token>" > /etc/watchfor-agent/token'
+sudo chown watchfor-agent:watchfor-agent /etc/watchfor-agent/token
+sudo cp packaging/agent.example.yml /etc/watchfor-agent/agent.yml   # then edit
+sudo -u watchfor-agent watchfor-agent check -config /etc/watchfor-agent/agent.yml
+```
+
+Then either the service or the cron job below.
+
+### As a systemd service
+
+```sh
+sudo cp packaging/watchfor-agent.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now watchfor-agent
+systemctl status watchfor-agent
+journalctl -u watchfor-agent -f
+```
+
+### From cron (no daemon)
+
+`once` collects, pushes one batch and exits. Cron's floor is a minute; the
+shortest interval your plan allows applies on top of that.
+
+```sh
+sudo cp packaging/watchfor-agent.cron /etc/cron.d/watchfor-agent
+```
+
+```cron
+* * * * * watchfor-agent /usr/local/bin/watchfor-agent once -config /etc/watchfor-agent/agent.yml
+```
+
+### Uninstall
+
+```sh
+sudo systemctl disable --now watchfor-agent
+sudo rm -f /etc/systemd/system/watchfor-agent.service /etc/cron.d/watchfor-agent /usr/local/bin/watchfor-agent
+sudo rm -rf /etc/watchfor-agent /var/lib/watchfor-agent
+sudo userdel watchfor-agent
+```
+
+Remove the host in the dashboard as well; that revokes the token and deletes
+its history.
 
 ## Configuration
 
@@ -90,7 +167,7 @@ Rates need two samples, so the first tick after start reports gauges only;
 Host facts (OS, kernel, CPU model and count, memory, virtualization, boot
 time) travel with the first batch and then once an hour.
 
-## Running as a service
+## The systemd unit
 
 `packaging/watchfor-agent.service` runs the agent as the `watchfor-agent`
 user with `ProtectSystem=strict`, an empty capability set and a memory cap.
@@ -135,17 +212,29 @@ uses the same directory, so a cron-driven host catches up on its next run.
 `host.id` is a hash of `/etc/machine-id`, not the id itself: stable across
 reinstalls of the agent, unlinkable to anything else that uses the machine id.
 
-## Building
+## Building from source
 
 ```sh
+git clone https://github.com/watchfor-io/agent.git && cd agent
 make build          # CGO_ENABLED=0, -trimpath, version from git describe
-make test
+make test           # go test -race
 make lint           # vet, staticcheck, govulncheck
+./watchfor-agent version
 ```
 
-Go 1.24 or newer. The only dependency outside the standard library is
-`gopkg.in/yaml.v3`. Releases are built by GoReleaser from a tag, reproducibly,
-with a `checksums.txt` next to the tarballs.
+Go 1.24 or newer, nothing else: the only dependency outside the standard
+library is `gopkg.in/yaml.v3`. Cross-compile with `GOARCH=arm64 make build`.
+Releases are built by GoReleaser from a tag (`git tag v0.1.0 && git push
+--tags` runs `.github/workflows/release.yml`), reproducibly, with a signed
+`checksums.txt` next to the tarballs.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | `once`/`check` finished; `run` stopped on SIGINT/SIGTERM |
+| 1 | configuration or runtime error (see the log) |
+| 3 | the server rejected the token — revoked, rotated, or the plan has no server monitoring; the unit does not restart on it |
 
 ## Contributing a module
 

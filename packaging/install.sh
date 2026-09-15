@@ -46,7 +46,7 @@ echo "downloading $TARBALL"
 curl -fsSL -o "$TMP/$TARBALL" "$BASE/$TARBALL"
 curl -fsSL -o "$TMP/checksums.txt" "$BASE/checksums.txt"
 if command -v minisign >/dev/null 2>&1 && curl -fsSL -o "$TMP/checksums.txt.minisig" "$BASE/checksums.txt.minisig" 2>/dev/null; then
-  minisign -Vm "$TMP/checksums.txt" -P "${WATCHFOR_AGENT_PUBKEY:-RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3}" >/dev/null \
+  minisign -Vm "$TMP/checksums.txt" -P "${WATCHFOR_AGENT_PUBKEY:-RWTUApo01PH7RyjD76wN2Vu7l5sO7Ys5psNQE9I7QYdWVfWSf0CetQje}" >/dev/null \
     || { echo "signature verification failed"; exit 1; }
 fi
 (cd "$TMP" && grep " $TARBALL\$" checksums.txt | sha256sum -c --quiet) || { echo "checksum mismatch"; exit 1; }

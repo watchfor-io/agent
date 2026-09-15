@@ -14,9 +14,23 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # Pure-Go minisign, pinned. The secret key is written to a 0600 file for
+      # the duration of the job; goreleaser reads it through
+      # MINISIGN_SECRET_KEY_FILE (see signs: in .goreleaser.yaml).
+      - name: Set up minisign
+        run: |
+          go install aead.dev/minisign/cmd/minisign@v0.3.0
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          echo "MINISIGN_SECRET_KEY_FILE=$RUNNER_TEMP/minisign.key" >> "$GITHUB_ENV"
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Remove the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/minisign.key"
