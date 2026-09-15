@@ -26,10 +26,16 @@ the unprivileged `watchfor-agent` user, writes the token to
 The host token comes from the WatchFor dashboard, one per host.
 
 It needs root, systemd, `curl`, `tar`, `sha256sum`, `useradd` and
-`minisign` — all checked before anything is touched; a missing tool ends
-the script with the package to install, not halfway through. The release
-signature is verified by default; on a box where you would rather not
-install minisign, `--skip-signature` trusts the sha256 checksum alone:
+`minisign` — all checked before anything is touched. A missing tool does
+not end the script halfway through: on a terminal, run with sudo, it
+shows the one install command for your distribution and offers to run it
+(`--yes` skips the question); otherwise it prints that command and stops.
+Progress, colours and the summary box appear only on a terminal; `--plain`
+(or `NO_COLOR=1`) keeps the output to plain lines for logs and CI. The release signature is verified by default. Once an
+agent 0.3.0 or newer is installed, upgrades no longer need minisign: the
+installed agent verifies the release with the key built into it. On a box
+where you would rather not install minisign at all, `--skip-signature`
+trusts the sha256 checksum alone:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/watchfor-io/agent/main/packaging/install.sh \
