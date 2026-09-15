@@ -71,7 +71,9 @@ Rules that hold for the whole file:
   start-up error.
 - `server.url` must be `https://` (plain `http://` is allowed for
   `localhost` only). `ca_file` pins a CA instead of the system store.
-- `interval` has a floor of 5 seconds.
+- `interval` has a floor of 5 seconds. The server answers each batch with the
+  shortest interval the account allows; when that is longer, the agent stretches
+  to it (logged once) and drops back as soon as the server allows it again.
 
 ## Modules
 

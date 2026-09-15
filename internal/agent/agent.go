@@ -16,7 +16,7 @@ import (
 )
 
 type Sink interface {
-	Send(ctx context.Context, body []byte) error
+	Send(ctx context.Context, body []byte) (push.Ack, error)
 }
 
 type Options struct {
@@ -37,6 +37,7 @@ const (
 
 type Agent struct {
 	o         Options
+	interval  time.Duration // effective: the configured one, or longer if the server asks
 	lastFacts time.Time
 	failing   map[string]string
 }
@@ -45,15 +46,19 @@ func New(o Options) *Agent {
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
-	return &Agent{o: o, failing: map[string]string{}}
+	return &Agent{o: o, interval: o.Interval, failing: map[string]string{}}
 }
+
+// Interval is the cadence currently in use.
+func (a *Agent) Interval() time.Duration { return a.interval }
 
 func (a *Agent) Run(ctx context.Context) error {
 	if err := a.tick(ctx); err != nil {
 		return err
 	}
-	t := time.NewTicker(a.o.Interval)
+	t := time.NewTicker(a.interval)
 	defer t.Stop()
+	current := a.interval
 	for {
 		select {
 		case <-ctx.Done():
@@ -62,8 +67,28 @@ func (a *Agent) Run(ctx context.Context) error {
 			if err := a.tick(ctx); err != nil {
 				return err
 			}
+			if a.interval != current {
+				current = a.interval
+				t.Reset(current)
+			}
 		}
 	}
+}
+
+// applyAck stretches the cadence to the server's minimum. The configured
+// interval stays the floor, so a plan upgrade brings the agent back down
+// without a restart.
+func (a *Agent) applyAck(ack push.Ack) {
+	want := max(a.o.Interval, time.Duration(ack.Interval)*time.Second)
+	if want == a.interval {
+		return
+	}
+	if want > a.o.Interval {
+		a.o.Log.Info("interval set by the server", "interval", want.String(), "configured", a.o.Interval.String())
+	} else {
+		a.o.Log.Info("interval back to the configured value", "interval", want.String())
+	}
+	a.interval = want
 }
 
 // Once is the cron mode: rates need two samples, so it collects, waits gap,
@@ -106,7 +131,7 @@ func (a *Agent) Collect(ctx context.Context) *metric.Payload {
 
 func (a *Agent) collect(ctx context.Context) *metric.Batch {
 	b := metric.NewBatch(time.Now())
-	budget := max(a.o.Interval/2, 2*time.Second)
+	budget := max(a.interval/2, 2*time.Second)
 	for _, m := range a.o.Modules {
 		mctx, cancel := context.WithTimeout(ctx, budget)
 		err := m.Collect(mctx, b)
@@ -137,7 +162,8 @@ func (a *Agent) send(ctx context.Context, p *metric.Payload) error {
 	if err != nil {
 		return err
 	}
-	if err := a.o.Sink.Send(ctx, body); err != nil {
+	ack, err := a.o.Sink.Send(ctx, body)
+	if err != nil {
 		switch {
 		case errors.Is(err, push.ErrUnauthorized):
 			a.o.Log.Error("token rejected, stopping", "error", err)
@@ -153,6 +179,7 @@ func (a *Agent) send(ctx context.Context, p *metric.Payload) error {
 		}
 		return nil
 	}
+	a.applyAck(ack)
 	a.replay(ctx)
 	return nil
 }
@@ -166,7 +193,7 @@ func (a *Agent) replay(ctx context.Context) {
 		if err != nil || name == "" {
 			return
 		}
-		if err := a.o.Sink.Send(ctx, body); err != nil {
+		if _, err := a.o.Sink.Send(ctx, body); err != nil {
 			if !push.Retryable(err) {
 				a.o.Log.Error("spooled batch dropped", "error", err)
 				a.o.Spool.Remove(name)

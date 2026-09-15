@@ -28,20 +28,21 @@ func (m *fakeModule) Collect(_ context.Context, b *metric.Batch) error {
 }
 
 type fakeSink struct {
-	fail error
-	got  []*metric.Payload
+	fail     error
+	interval int // what the server asks for, seconds
+	got      []*metric.Payload
 }
 
-func (s *fakeSink) Send(_ context.Context, body []byte) error {
+func (s *fakeSink) Send(_ context.Context, body []byte) (push.Ack, error) {
 	if s.fail != nil {
-		return s.fail
+		return push.Ack{}, s.fail
 	}
 	p, err := push.Decode(body)
 	if err != nil {
-		return err
+		return push.Ack{}, err
 	}
 	s.got = append(s.got, p)
-	return nil
+	return push.Ack{Accepted: len(p.Samples), Interval: s.interval}, nil
 }
 
 func newAgent(t *testing.T, sink Sink, sp *spool.Spool) *Agent {
@@ -129,5 +130,24 @@ func TestModuleFailureLoggedOnce(t *testing.T) {
 	a.note("m", nil)
 	if len(a.failing) != 0 {
 		t.Error("recovery should clear the failure")
+	}
+}
+
+func TestServerIntervalStretchesAndReleases(t *testing.T) {
+	sink := &fakeSink{interval: 60}
+	a := newAgent(t, sink, nil)
+	if err := a.Once(context.Background(), time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if a.Interval() != 60*time.Second {
+		t.Fatalf("interval = %s, want 60s from the server", a.Interval())
+	}
+	// A shorter server value never goes below the configured interval.
+	sink.interval = 1
+	if err := a.Once(context.Background(), time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if a.Interval() != a.o.Interval {
+		t.Fatalf("interval = %s, want the configured %s", a.Interval(), a.o.Interval)
 	}
 }

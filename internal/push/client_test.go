@@ -54,7 +54,7 @@ func TestSendHeadersAndStatuses(t *testing.T) {
 	body, _ := Encode(payload())
 
 	status = http.StatusAccepted
-	if err := c.Send(context.Background(), body); err != nil {
+	if _, err := c.Send(context.Background(), body); err != nil {
 		t.Fatalf("202 should be success: %v", err)
 	}
 	if got.Get("Authorization") != "Bearer tok-123" || got.Get("Content-Encoding") != "gzip" || !strings.HasPrefix(got.Get("User-Agent"), "watchfor-agent/9.9.9") {
@@ -62,19 +62,19 @@ func TestSendHeadersAndStatuses(t *testing.T) {
 	}
 
 	status = http.StatusUnauthorized
-	if err := c.Send(context.Background(), body); !errors.Is(err, ErrUnauthorized) || Retryable(err) {
+	if _, err := c.Send(context.Background(), body); !errors.Is(err, ErrUnauthorized) || Retryable(err) {
 		t.Errorf("401: err=%v retryable=%v", err, Retryable(err))
 	}
 	status = http.StatusTooManyRequests
-	if err := c.Send(context.Background(), body); !Retryable(err) {
+	if _, err := c.Send(context.Background(), body); !Retryable(err) {
 		t.Errorf("429 must be retryable, got %v", err)
 	}
 	status = http.StatusBadGateway
-	if err := c.Send(context.Background(), body); !Retryable(err) {
+	if _, err := c.Send(context.Background(), body); !Retryable(err) {
 		t.Errorf("502 must be retryable, got %v", err)
 	}
 	status = http.StatusRequestEntityTooLarge
-	err = c.Send(context.Background(), body)
+	_, err = c.Send(context.Background(), body)
 	var se *StatusError
 	if !errors.As(err, &se) || se.Code != 413 || Retryable(err) || !strings.Contains(err.Error(), "nope") {
 		t.Errorf("413: err=%v retryable=%v", err, Retryable(err))
@@ -83,7 +83,7 @@ func TestSendHeadersAndStatuses(t *testing.T) {
 
 func TestNetworkErrorIsRetryable(t *testing.T) {
 	c, _ := New("http://127.0.0.1:1", "t", "", 200*time.Millisecond, "x")
-	if err := c.Send(context.Background(), []byte("x")); !Retryable(err) {
+	if _, err := c.Send(context.Background(), []byte("x")); !Retryable(err) {
 		t.Errorf("connection refused must be retryable, got %v", err)
 	}
 }

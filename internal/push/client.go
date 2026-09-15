@@ -47,6 +47,15 @@ func Retryable(err error) bool {
 	return !errors.Is(err, ErrUnauthorized) && err != nil
 }
 
+// Ack is the server's answer to an accepted batch. Interval is the shortest
+// push interval the account allows, in seconds; the agent stretches to it
+// when its own setting is faster. Zero means the server has no opinion.
+type Ack struct {
+	Accepted int `json:"accepted"`
+	Dropped  int `json:"dropped"`
+	Interval int `json:"interval"`
+}
+
 type Client struct {
 	endpoint  string
 	token     string
@@ -102,10 +111,10 @@ func Decode(body []byte) (*metric.Payload, error) {
 	return &p, nil
 }
 
-func (c *Client) Send(ctx context.Context, body []byte) error {
+func (c *Client) Send(ctx context.Context, body []byte) (Ack, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return Ack{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
@@ -114,7 +123,7 @@ func (c *Client) Send(ctx context.Context, body []byte) error {
 
 	res, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return Ack{}, err
 	}
 	defer res.Body.Close()
 	msg, _ := io.ReadAll(io.LimitReader(res.Body, 1024))
@@ -122,10 +131,18 @@ func (c *Client) Send(ctx context.Context, body []byte) error {
 
 	switch {
 	case res.StatusCode >= 200 && res.StatusCode < 300:
-		return nil
+		var ack Ack
+		// An empty or non-JSON body is still a success; only the hint is lost.
+		_ = json.Unmarshal(msg, &ack)
+		return ack, nil
 	case res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden:
-		return ErrUnauthorized
+		// Keep the server's reason: "unknown or revoked token" and "hosts are
+		// not included in this plan" call for different fixes.
+		if reason := strings.TrimSpace(string(msg)); reason != "" {
+			return Ack{}, fmt.Errorf("%w: %s", ErrUnauthorized, reason)
+		}
+		return Ack{}, ErrUnauthorized
 	default:
-		return &StatusError{Code: res.StatusCode, Body: strings.TrimSpace(string(msg))}
+		return Ack{}, &StatusError{Code: res.StatusCode, Body: strings.TrimSpace(string(msg))}
 	}
 }

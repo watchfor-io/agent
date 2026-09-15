@@ -190,14 +190,14 @@ func names(mods []modules.Module) []string {
 // printSink is the `check` destination: the exact batch, decoded, on stdout.
 type printSink struct{}
 
-func (printSink) Send(_ context.Context, body []byte) error {
+func (printSink) Send(_ context.Context, body []byte) (push.Ack, error) {
 	p, err := push.Decode(body)
 	if err != nil {
-		return err
+		return push.Ack{}, err
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
-	return enc.Encode(p)
+	return push.Ack{Accepted: len(p.Samples)}, enc.Encode(p)
 }
 
 func newLogger(level string) *slog.Logger {
