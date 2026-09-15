@@ -25,9 +25,16 @@ the unprivileged `watchfor-agent` user, writes the token to
 `/etc/watchfor-agent/token` with mode 0600 and enables the systemd unit.
 The host token comes from the WatchFor dashboard, one per host.
 
-It needs root, systemd, and `curl`, `tar`, `sha256sum`, `useradd` — all
-checked before anything is touched; a missing tool ends the script with the
-package to install, not halfway through.
+It needs root, systemd, `curl`, `tar`, `sha256sum`, `useradd` and
+`minisign` — all checked before anything is touched; a missing tool ends
+the script with the package to install, not halfway through. The release
+signature is verified by default; on a box where you would rather not
+install minisign, `--skip-signature` trusts the sha256 checksum alone:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/watchfor-io/agent/main/packaging/install.sh \
+  | sudo sh -s -- --token <host-token> --skip-signature
+```
 
 Prefer to look before you run? Download the tarball from the releases page,
 put the binary anywhere, and run it by hand:
