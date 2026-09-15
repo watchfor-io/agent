@@ -121,6 +121,43 @@ sudo userdel watchfor-agent
 Remove the host in the dashboard as well; that revokes the token and deletes
 its history.
 
+## Upgrade
+
+The server tells a running agent when a newer release exists (it rides on
+the answer to every batch, so the agent never talks to anything but
+`server.url`). The agent logs it once — `update available … sudo
+watchfor-agent upgrade` — and the host page in the dashboard shows the
+same next to the version. Then, on the server:
+
+```sh
+sudo watchfor-agent upgrade            # to the version the server reported
+sudo watchfor-agent upgrade -check     # only report; exit 10 if one is available
+sudo watchfor-agent upgrade -version 0.3.0
+```
+
+`upgrade` downloads the release from github.com/watchfor-io/agent over
+HTTPS (only GitHub's release hosts are accepted, redirects included),
+verifies `checksums.txt` against the minisign key built into the binary —
+the same key as above — checks the archive's sha256 against that signed
+file, runs the new binary once to confirm it reports the expected version,
+swaps it in with an atomic rename and restarts the service. It refuses to
+downgrade unless told so (`-allow-downgrade`), and nothing is replaced
+unless every check passed. Re-running the install script does the same
+job with the same checks and keeps the token and `agent.yml`.
+
+Hosts that should keep themselves current can opt in to a daily timer:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/watchfor-io/agent/main/packaging/install.sh \
+  | sudo sh -s -- --auto-update        # --no-auto-update removes it again
+```
+
+The timer (`watchfor-agent-update.timer`, once a day with up to six hours
+of jitter) runs `watchfor-agent upgrade -if-available`, which acts only on
+the version the server reported and never polls GitHub on its own. The
+daemon itself stays unprivileged: the swap is done by the root-run
+one-shot unit, not by the running agent.
+
 ## Configuration
 
 `/etc/watchfor-agent/agent.yml` — every key with its default is in

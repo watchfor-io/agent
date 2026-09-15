@@ -4,6 +4,7 @@
 //	watchfor-agent run      daemon; systemd runs this
 //	watchfor-agent once     one collection, one push, exit (cron)
 //	watchfor-agent check    print what would be sent, no network
+//	watchfor-agent upgrade  install a newer signed release, restart the service
 //	watchfor-agent version
 package main
 
@@ -61,6 +62,8 @@ func run(args []string) int {
 	case "version", "-version", "--version":
 		fmt.Println("watchfor-agent " + Version)
 		return exitOK
+	case "upgrade":
+		return runUpgrade(args)
 	case "run", "once", "check":
 	default:
 		usage()
@@ -100,6 +103,7 @@ func run(args []string) int {
 		Facts:    hostinfo.Facts,
 		Version:  Version,
 		Interval: cfg.Interval,
+		StateDir: cfg.Spool.Dir,
 		Log:      log,
 	}
 
@@ -219,6 +223,7 @@ func usage() {
   run      collect on the configured interval and push (the systemd service)
   once     collect once, push once, exit — for cron
   check    collect once and print the batch that would be sent; no network
+  upgrade  install a newer signed release (root); -check only reports
   version
 `, defaultConfig)
 }

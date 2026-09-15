@@ -54,6 +54,10 @@ type Ack struct {
 	Accepted int `json:"accepted"`
 	Dropped  int `json:"dropped"`
 	Interval int `json:"interval"`
+	// LatestVersion is the newest agent release the server knows of, so a
+	// host learns about updates through the one connection it already has.
+	// Empty when the server has no opinion.
+	LatestVersion string `json:"latest_version"`
 }
 
 type Client struct {

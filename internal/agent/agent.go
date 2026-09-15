@@ -13,6 +13,7 @@ import (
 	"github.com/watchfor-io/agent/internal/modules"
 	"github.com/watchfor-io/agent/internal/push"
 	"github.com/watchfor-io/agent/internal/spool"
+	"github.com/watchfor-io/agent/internal/update"
 )
 
 type Sink interface {
@@ -27,6 +28,9 @@ type Options struct {
 	Facts    func() metric.Facts
 	Version  string
 	Interval time.Duration
+	// StateDir is where a newer-release hint is left for `upgrade` (the
+	// spool directory). Empty disables the file; the log line still appears.
+	StateDir string
 	Log      *slog.Logger
 }
 
@@ -40,6 +44,10 @@ type Agent struct {
 	interval  time.Duration // effective: the configured one, or longer if the server asks
 	lastFacts time.Time
 	failing   map[string]string
+	// updateNoted is the newer version already logged, so the warning
+	// appears once per release, not once per push.
+	updateNoted  string
+	stateCleared bool
 }
 
 func New(o Options) *Agent {
@@ -180,8 +188,38 @@ func (a *Agent) send(ctx context.Context, p *metric.Payload) error {
 		return nil
 	}
 	a.applyAck(ack)
+	a.noteUpdate(ack.LatestVersion)
 	a.replay(ctx)
 	return nil
+}
+
+// noteUpdate acts on the server's "latest release" hint: one warning per
+// newer version, plus the state file `watchfor-agent upgrade` reads. A
+// development build is never nagged. When the server stops reporting a
+// newer version (this host was upgraded by hand), the stale hint goes.
+func (a *Agent) noteUpdate(latest string) {
+	cur, err := update.Parse(a.o.Version)
+	if err != nil {
+		return
+	}
+	lv, err := update.Parse(latest)
+	if err != nil || update.Compare(lv, cur) <= 0 {
+		if !a.stateCleared {
+			a.stateCleared = true
+			_ = update.ClearState(a.o.StateDir)
+		}
+		return
+	}
+	if a.updateNoted == lv.String() {
+		return
+	}
+	a.updateNoted = lv.String()
+	a.o.Log.Warn("update available", "running", a.o.Version, "latest", lv.String(), "how", "sudo watchfor-agent upgrade")
+	if a.o.StateDir != "" {
+		if err := update.WriteState(a.o.StateDir, lv.String()); err != nil {
+			a.o.Log.Debug("could not record the update hint", "dir", a.o.StateDir, "error", err)
+		}
+	}
 }
 
 func (a *Agent) replay(ctx context.Context) {

@@ -26,3 +26,11 @@ rewritten one.
 - Releases are static binaries built from the tag by GoReleaser; the
   `checksums.txt` is signed with minisign. The public key is in
   `packaging/install.sh` and in the README.
+- `watchfor-agent upgrade` installs only a release whose `checksums.txt`
+  carries a valid signature by that key (the key is compiled into the
+  binary), whose archive matches the signed checksum, and whose binary
+  reports the expected version; it talks HTTPS to GitHub's release hosts
+  only and refuses redirects elsewhere. The server can announce a newer
+  version, but cannot make an agent install anything unsigned — and the
+  running daemon never replaces itself; the swap is a separate root-run
+  one-shot (manual, or the opt-in daily timer).
