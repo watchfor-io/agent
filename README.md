@@ -25,6 +25,10 @@ the unprivileged `watchfor-agent` user, writes the token to
 `/etc/watchfor-agent/token` with mode 0600 and enables the systemd unit.
 The host token comes from the WatchFor dashboard, one per host.
 
+It needs root, systemd, and `curl`, `tar`, `sha256sum`, `useradd` — all
+checked before anything is touched; a missing tool ends the script with the
+package to install, not halfway through.
+
 Prefer to look before you run? Download the tarball from the releases page,
 put the binary anywhere, and run it by hand:
 

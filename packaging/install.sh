@@ -23,8 +23,22 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Everything the script needs, checked up front: a clear list beats a
+# "command not found" halfway through. minisign is optional (signature check).
+missing=""
+for tool in curl tar sha256sum mktemp install useradd id grep sed uname; do
+  command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+  echo "missing required tools:$missing" >&2
+  echo "install them and run again — Debian/Ubuntu: apt-get install -y curl tar coreutils passwd" >&2
+  echo "                              RHEL/Alma/Rocky: dnf install -y curl tar coreutils shadow-utils" >&2
+  echo "                              openSUSE: zypper install -y curl tar coreutils shadow" >&2
+  echo "optional: minisign, to verify the release signature as well as the checksum" >&2
+  exit 1
+fi
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)"; exit 1; }
-command -v systemctl >/dev/null || { echo "systemd is required; for other init systems install the binary manually"; exit 1; }
+command -v systemctl >/dev/null || { echo "systemd is required; for other init systems install the binary by hand (see README: Install by hand)"; exit 1; }
 
 case "$(uname -m)" in
   x86_64|amd64) ARCH=amd64 ;;
