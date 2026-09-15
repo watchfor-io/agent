@@ -151,6 +151,43 @@ case " $DISTRO_ID $DISTRO_LIKE " in
   *debian*|*ubuntu*|*mint*|*pop*) FAMILY=debian ;;
   *) FAMILY="" ;;
 esac
+
+# ── Preflight ────────────────────────────────────────────────────────────
+# The agent reads /proc and /sys and runs as a systemd service: Linux on
+# amd64 or arm64. Anything else is told so here, before any other check
+# could produce a confusing "missing: sha256sum useradd".
+problem() { printf '%s%s %s%s\n\n' "$C_RED" "$I_BAD" "$1" "$C_OFF" >&2; }
+OS=$(uname -s 2>/dev/null || echo unknown)
+case "$OS" in
+  Linux) ;;
+  Darwin)
+    problem "macOS is not supported"
+    cat >&2 <<'MSG'
+  watchfor-agent monitors Linux servers: it reads /proc and /sys and runs
+  as a systemd service. Releases are built for Linux amd64 and arm64;
+  Windows is planned, macOS is not. Install it on the Linux host you
+  want to watch: https://watchfor.io/docs/hosts
+
+MSG
+    exit 1 ;;
+  *)
+    problem "$OS is not supported"
+    cat >&2 <<'MSG'
+  watchfor-agent monitors Linux servers: it reads /proc and /sys and runs
+  as a systemd service. Releases are built for Linux amd64 and arm64.
+  https://watchfor.io/docs/hosts
+
+MSG
+    exit 1 ;;
+esac
+case "$(uname -m)" in
+  x86_64|amd64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  *)
+    problem "unsupported architecture: $(uname -m)"
+    printf '  Releases are built for linux/amd64 and linux/arm64. For another\n  architecture build from source: https://github.com/%s#building-from-source\n\n' "$REPO" >&2
+    exit 1 ;;
+esac
 CURRENT=""
 [ -x "$BIN" ] && CURRENT=$("$BIN" version 2>/dev/null | awk '{print $2}')
 
@@ -273,13 +310,16 @@ WHY
   fi
 fi
 [ "$(id -u)" -eq 0 ] || fail "run as root (sudo)"
-command -v systemctl >/dev/null || fail "systemd is required; for other init systems install the binary by hand (see README: Install by hand)"
+if ! command -v systemctl >/dev/null 2>&1; then
+  problem "systemd not found on ${DISTRO_NAME:-this system}"
+  cat >&2 <<MSG
+  This script installs watchfor-agent as a systemd service. Without
+  systemd, install the binary by hand and run it from cron instead —
+  both are a few lines: https://github.com/$REPO#install-by-hand
 
-case "$(uname -m)" in
-  x86_64|amd64) ARCH=amd64 ;;
-  aarch64|arm64) ARCH=arm64 ;;
-  *) fail "unsupported architecture: $(uname -m)" ;;
-esac
+MSG
+  exit 1
+fi
 
 # ── The release ──────────────────────────────────────────────────────────
 if [ "$VERSION" = "latest" ]; then
@@ -414,11 +454,11 @@ line() { printf '%s%s%s  %s%-12s%s %-*.*s %s%s%s\n' "$C_DIM" "$B_V" "$C_OFF" "$C
 title=" $("$BIN" version) "
 tlen=${#title}
 printf '\n%s%s%s%s%s%s%s' "$C_DIM" "$B_TL" "$B_H" "$C_OFF" "$C_BOLD$C_GREEN" "$title" "$C_OFF"
-printf '%s%s%s%s\n' "$C_DIM" "$(rule $((W + 14 - tlen)))" "$B_TR" "$C_OFF"
+printf '%s%s%s%s\n' "$C_DIM" "$(rule $((W + 15 - tlen)))" "$B_TR" "$C_OFF"
 line "service" "$service_state"
 line "config" "$ETC/agent.yml"
 line "auto-update" "$update_state"
 line "status" "systemctl status watchfor-agent"
 line "logs" "journalctl -u watchfor-agent -f"
 [ -n "$TOKEN" ] || [ -s "$ETC/token" ] || line "token" "missing: $ETC/token (chmod 600), then restart"
-printf '%s%s%s%s%s\n\n' "$C_DIM" "$B_BL" "$(rule $((W + 15)))" "$B_BR" "$C_OFF"
+printf '%s%s%s%s%s\n\n' "$C_DIM" "$B_BL" "$(rule $((W + 16)))" "$B_BR" "$C_OFF"
