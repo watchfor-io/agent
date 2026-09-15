@@ -1,0 +1,43 @@
+[Unit]
+Description=WatchFor host agent
+Documentation=https://github.com/watchfor-io/agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=watchfor-agent
+Group=watchfor-agent
+ExecStart=/usr/local/bin/watchfor-agent run -config /etc/watchfor-agent/agent.yml
+Restart=always
+RestartSec=5s
+# Exit 3 = the server rejected the token; restarting would only repeat it.
+RestartPreventExitStatus=3
+Environment=GOMAXPROCS=2
+
+# Outbound HTTPS only; reads /proc and /sys; writes only the spool.
+ReadWritePaths=/var/lib/watchfor-agent
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+MemoryMax=256M
+TasksMax=64
+
+# Root-only data (per-process I/O, some /sys files, container sockets):
+# uncomment to grant read access everywhere without running as root.
+#AmbientCapabilities=CAP_DAC_READ_SEARCH
+#CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target

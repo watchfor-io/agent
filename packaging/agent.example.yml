@@ -1,0 +1,42 @@
+# /etc/watchfor-agent/agent.yml — every key shown with its default.
+# Unknown keys are an error. Try it: watchfor-agent check
+
+server:
+  url: https://ingest.watchfor.io
+  token_file: /etc/watchfor-agent/token   # 0600; or token: env:WATCHFOR_TOKEN
+  # ca_file: /etc/watchfor-agent/ca.pem   # pin a CA instead of the system store
+  # timeout: 15s
+
+host:
+  # name: web-01                          # default: short hostname
+  # tags: { env: prod, role: web }        # at most 32; keys [a-z0-9_.-]
+
+interval: 15s                             # minimum 5s
+
+spool:                                    # batches kept while the server is unreachable
+  dir: /var/lib/watchfor-agent
+  max_mb: 64                              # oldest dropped first; 0 disables
+
+log:
+  level: info                             # debug | info | warn | error
+
+modules:
+  system: {}                              # cpu, load, memory, swap, uptime
+  #   per_core: true
+
+  disk: {}                                # usage per mount, I/O per whole disk
+  #   mounts: [/, /data]                  # default: every real filesystem
+  #   ignore_fs: [nfs]                    # on top of the built-in pseudo-fs list
+  #   devices: [nvme0n1]                  # default: whole disks, not partitions
+  #   io: true
+
+  network: {}                             # rates per interface, socket counts
+  #   interfaces: [eth0]                  # default: all except `ignore`
+  #   ignore: [lo, "veth*", "docker*", "br-*", "virbr*"]
+
+  processes:                              # state counts, top consumers, watches
+    top: 10
+    # watch:
+    #   - name: nginx                     # comm, the 15-char kernel name
+    #   - cmdline: postgres -D            # substring of the command line
+    #     user: postgres

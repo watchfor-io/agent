@@ -1,0 +1,24 @@
+version: 2
+project_name: watchfor-agent
+builds:
+  - main: ./cmd/watchfor-agent
+    binary: watchfor-agent
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.Version={{.Version}}"]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md, packaging/agent.example.yml, packaging/watchfor-agent.service]
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+changelog:
+  use: github
+  filters:
+    exclude: ["^docs:", "^test:", "^ci:"]
+release:
+  draft: true
