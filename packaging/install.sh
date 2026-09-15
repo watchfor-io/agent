@@ -29,6 +29,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+cat <<'BANNER'
+
+   __      __         _          _        ___
+   \ \    / /  __ _  | |_   __  | |_     | __|  ___   _ _
+    \ \/\/ /  / _` | |  _| / _| | ' \    | _|  / _ \ | '_|
+     \_/\_/   \__,_|  \__| \__| |_||_|   |_|   \___/ |_|
+
+Know before your customers do - and let your agents know too.
+                     https://watchfor.io
+
+BANNER
+
 # Everything the script needs, checked up front: a clear list beats a
 # "command not found" halfway through. The release signature is verified by
 # default, so minisign is required unless --skip-signature says otherwise.
