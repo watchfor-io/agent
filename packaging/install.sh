@@ -5,12 +5,11 @@
 # agent upgrades it in place: the token and agent.yml are kept, the service
 # is restarted.
 #
-#   curl -fsSL https://raw.githubusercontent.com/watchfor-io/agent/main/packaging/install.sh | sudo sh -s -- --token <host-token>
+#   curl -fsSL https://watchfor.io/agent/install.sh | sudo sh -s -- --token <host-token>
 #
 # Options: --token <t>  --server <url>  --version <vX.Y.Z>
 #          --token -          ask for the token on the terminal (not echoed) — keeps it
 #                             out of `ps` and shell history; WATCHFOR_TOKEN env works too
-#          --skip-signature   rely on the sha256 checksum only (no minisign needed)
 #          --auto-update      enable the daily update timer (installs newer signed
 #                             releases the server reports; --no-auto-update removes it;
 #                             with neither, an interactive run asks)
@@ -20,43 +19,49 @@
 #          --plain            no colours, spinners or screen clearing (also: NO_COLOR=1,
 #                             or any output that is not a terminal)
 #          --no-clear         keep what is on the terminal
+#          --uninstall        remove the agent: service, timer, cron entry, binary,
+#                             state, config with the token, and the service user
+#                             (--keep-config leaves /etc/watchfor-agent in place)
 #
-# Missing tools: on a terminal, as root, the script offers to install them
-# with the distribution's package manager and then carries on.
+# Needs only curl, tar, sha256sum and the usual base tools — nothing for
+# the verification: the tarball comes from GitHub (storage only), its
+# checksums from watchfor.io (signature-verified there), and the downloaded
+# agent checks the release signature itself with its built-in key.
+# Missing base tools: on a terminal, as root, the script offers to install
+# them with the distribution's package manager and then carries on.
 #
 set -eu
 
 REPO="${WATCHFOR_AGENT_REPO:-watchfor-io/agent}"
+# Where the release files (tarball, signature) are downloaded from — GitHub,
+# storage only; a mirror works too, the checks below do not trust it.
+DOWNLOAD="${WATCHFOR_AGENT_DOWNLOAD_URL:-https://github.com/$REPO/releases/download}"
 VERSION="${WATCHFOR_AGENT_VERSION:-latest}"
 SERVER="${WATCHFOR_SERVER:-https://ingest.watchfor.io}"
+# Where the verified release files are served from: /latest, /checksums/<tag>.txt
+RELEASES="${WATCHFOR_RELEASES_URL:-https://watchfor.io/agent}"
 TOKEN="${WATCHFOR_TOKEN:-}"
-SKIP_SIGNATURE=0
 AUTO_UPDATE=""
 REINSTALL=0
+UNINSTALL=0
+KEEP_CONFIG=0
 CLEAR=1
 ASSUME_YES=0
 PLAIN=0
-PUBKEY="${WATCHFOR_AGENT_PUBKEY:-RWTUApo01PH7RyjD76wN2Vu7l5sO7Ys5psNQE9I7QYdWVfWSf0CetQje}"
 BIN="${WATCHFOR_AGENT_BIN:-/usr/local/bin/watchfor-agent}"
 ETC=/etc/watchfor-agent
 LIB=/var/lib/watchfor-agent
-# From this version on the installed agent verifies releases itself (the
-# release key is built into it), so an upgrade no longer needs minisign.
-SELF_VERIFY_SINCE=0.3.0
-# From this version the agent manages the auto-update timer itself
-# (`watchfor-agent auto-update on|off`, units embedded) and records the
-# choice in agent.yml; older agents get the units fetched from the tag.
-AUTO_UPDATE_CLI_SINCE=0.4.0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --token) TOKEN="$2"; shift 2 ;;
     --server) SERVER="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
-    --skip-signature) SKIP_SIGNATURE=1; shift ;;
     --auto-update) AUTO_UPDATE=1; shift ;;
     --no-auto-update) AUTO_UPDATE=0; shift ;;
     --reinstall) REINSTALL=1; shift ;;
+    --uninstall) UNINSTALL=1; shift ;;
+    --keep-config) KEEP_CONFIG=1; shift ;;
     --no-clear) CLEAR=0; shift ;;
     --plain) PLAIN=1; CLEAR=0; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
@@ -121,6 +126,7 @@ cleanup() {
   [ "$ECHO_OFF" = 0 ] || stty echo 2>/dev/null < /dev/tty || true
   printf '%s' "$SHOW"
   rm -rf "$TMP"
+  [ -z "${BIN:-}" ] || rm -f "$BIN.new"
 }
 trap cleanup EXIT
 interrupted() {
@@ -244,23 +250,6 @@ esac
 CURRENT=""
 [ -x "$BIN" ] && CURRENT=$("$BIN" version 2>/dev/null | awk '{print $2}')
 
-# ver_ge A B: true when release A is at least B (MAJOR.MINOR.PATCH; a
-# "-dev" or "+build" suffix is ignored).
-ver_ge() {
-  a=$(printf '%s' "$1" | sed 's/^v//; s/[-+].*//'); b=$(printf '%s' "$2" | sed 's/^v//; s/[-+].*//')
-  [ "$(printf '%s\n%s\n' "$a" "$b" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = "$b" ]
-}
-
-# The release signature is checked before anything is installed. That is
-# minisign's job — unless an agent that verifies releases itself is
-# already here; then it does the download and the check with its built-in key.
-VERIFY_BY=minisign
-if [ "$SKIP_SIGNATURE" = 1 ]; then
-  VERIFY_BY=none
-elif ! command -v minisign >/dev/null 2>&1 && [ -n "$CURRENT" ] && ver_ge "$CURRENT" "$SELF_VERIFY_SINCE"; then
-  VERIFY_BY=agent
-fi
-
 # ── Required tools ───────────────────────────────────────────────────────
 # Everything the script needs, checked up front: one clear list beats a
 # "command not found" halfway through.
@@ -268,7 +257,6 @@ missing=""
 for tool in curl tar sha256sum mktemp install useradd id grep sed uname; do
   command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
-[ "$VERIFY_BY" != minisign ] || command -v minisign >/dev/null 2>&1 || missing="$missing minisign"
 
 # pkgs_for <family>: the packages that provide the missing tools there.
 pkgs_for() {
@@ -288,10 +276,7 @@ cmd_for() {
   case "$1" in
     debian) printf 'apt-get install -y %s' "$(pkgs_for debian)" ;;
     fedora) printf '%s install -y %s' "$(dnf_or_yum)" "$(pkgs_for fedora)" ;;
-    rhel)   case "$missing" in
-              *minisign*) printf '%s install -y epel-release && %s install -y %s' "$(dnf_or_yum)" "$(dnf_or_yum)" "$(pkgs_for rhel)" ;;
-              *) printf '%s install -y %s' "$(dnf_or_yum)" "$(pkgs_for rhel)" ;;
-            esac ;;
+    rhel)   printf '%s install -y %s' "$(dnf_or_yum)" "$(pkgs_for rhel)" ;;
     suse)   printf 'zypper install -y %s' "$(pkgs_for suse)" ;;
     arch)   printf 'pacman -S --noconfirm %s' "$(pkgs_for arch)" ;;
     alpine) printf 'apk add %s' "$(pkgs_for alpine)" ;;
@@ -314,7 +299,6 @@ install_pkgs() {
       step "installing$missing" apt-get -q -y -o DPkg::Lock::Timeout=180 -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef install $_p ;;
     fedora|rhel)
       _m=$(dnf_or_yum)
-      case "$1$missing" in rhel*minisign*) step "enabling EPEL" "$_m" -y -q install epel-release || return 1 ;; esac
       # shellcheck disable=SC2086
       step "installing$missing" "$_m" -y -q --setopt=install_weak_deps=False install $_p ;;
     suse)
@@ -348,18 +332,70 @@ ask() {
 # interactive: a terminal to ask on (and no --yes).
 interactive() { [ "$ASSUME_YES" != 1 ] && ( : < /dev/tty ) 2>/dev/null; }
 
+# ── Uninstall ────────────────────────────────────────────────────────────
+# Everything the installer put here, in reverse: service and timer, cron
+# entry, state, config with the token (overwritten before it is deleted),
+# the service user, the binary. The agent does the work (`uninstall` reads
+# the paths agent.yml names); without a working binary the same steps run
+# from here with the default paths. Nothing is removed without a yes.
+if [ "$UNINSTALL" = 1 ]; then
+  [ "$(id -u)" -eq 0 ] || fail "uninstall needs root: re-run with sudo"
+  present=""
+  [ -e /etc/systemd/system/watchfor-agent.service ] && present="$present /etc/systemd/system/watchfor-agent.service"
+  [ -e /etc/systemd/system/watchfor-agent-update.timer ] && present="$present /etc/systemd/system/watchfor-agent-update.timer"
+  [ -e /etc/cron.d/watchfor-agent ] && present="$present /etc/cron.d/watchfor-agent"
+  [ -e "$LIB" ] && present="$present $LIB"
+  [ -e "$ETC" ] && [ "$KEEP_CONFIG" = 0 ] && present="$present $ETC"
+  [ -e "$BIN" ] && present="$present $BIN"
+  id -u watchfor-agent >/dev/null 2>&1 && present="$present user:watchfor-agent"
+  if [ -z "$present" ]; then ok "nothing of watchfor-agent is on this machine"; exit 0; fi
+  printf '%sThis removes watchfor-agent from this machine:%s\n' "$C_BOLD" "$C_OFF"
+  for p in $present; do printf '  %s\n' "$p"; done
+  [ "$KEEP_CONFIG" = 0 ] || note "  $ETC is kept (--keep-config)"
+  printf '\n'
+  ask "  Remove all of the above?" n y || { note "nothing removed"; exit 0; }
+  printf '\n'
+  if [ -n "$CURRENT" ]; then
+    keep=""; [ "$KEEP_CONFIG" = 0 ] || keep="-keep-config"
+    if out=$("$BIN" uninstall -yes $keep 2>&1); then
+      printf '%s\n' "$out" | grep -v '^This removes\|^  \|^watchfor-agent removed' | sed "s/^/  /"
+      ok "removed watchfor-agent $CURRENT"
+    else
+      printf '%s\n' "$out" >&2; fail "uninstall failed"
+    fi
+  else
+    # no working binary to ask: the same steps by hand, default paths
+    systemctl disable -q --now watchfor-agent 2>/dev/null || true
+    systemctl disable -q --now watchfor-agent-update.timer 2>/dev/null || true
+    for f in /etc/systemd/system/watchfor-agent.service /etc/systemd/system/watchfor-agent-update.service \
+             /etc/systemd/system/watchfor-agent-update.timer /etc/cron.d/watchfor-agent /run/lock/watchfor-agent-upgrade.lock; do
+      [ -e "$f" ] || continue
+      rm -f "$f" && note "  removed $f"
+    done
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed watchfor-agent 2>/dev/null || true
+    if [ -e "$LIB" ]; then rm -rf "$LIB" && note "  removed $LIB"; fi
+    if [ "$KEEP_CONFIG" = 1 ]; then
+      note "  kept $ETC"
+    elif [ -e "$ETC" ]; then
+      # zero the token before the unlink so it does not linger in freed blocks
+      [ -f "$ETC/token" ] && dd if=/dev/zero of="$ETC/token" bs=1 count="$(wc -c < "$ETC/token")" conv=notrunc 2>/dev/null
+      rm -rf "$ETC" && note "  removed $ETC (token overwritten first)"
+    fi
+    if id -u watchfor-agent >/dev/null 2>&1; then userdel watchfor-agent 2>/dev/null && note "  removed system user watchfor-agent"; fi
+    if [ -e "$BIN" ]; then rm -f "$BIN" && note "  removed $BIN"; fi
+    ok "removed watchfor-agent${CURRENT:+ $CURRENT}"
+  fi
+  printf '\n'
+  note "Remove the host in WatchFor as well (Hosts → the host → Remove): that"
+  note "revokes its token and drops its history."
+  printf '\n'
+  exit 0
+fi
+
 if [ -n "$missing" ]; then
   printf '%s%s missing:%s%s\n\n' "$C_RED" "$I_BAD" "$C_OFF" "$missing" >&2
-  case "$missing" in *minisign*)
-    cat >&2 <<'WHY'
-  Every release ships checksums.txt signed with the WatchFor release key,
-  and this script verifies that signature before it installs anything.
-  The check needs the minisign tool; without it the download would be
-  trusted on TLS alone.
-
-WHY
-  esac
-  case "$missing" in " minisign") what=it ;; *) what=them ;; esac
+  case "$missing" in " "*" "*) what=them ;; *) what=it ;; esac
   cmd=""; [ -z "$FAMILY" ] || cmd=$(cmd_for "$FAMILY")
   if [ -n "$cmd" ] && [ "$(id -u)" -eq 0 ]; then
     printf '  Install %s with:  %s%s%s   %s%s%s\n\n' "$what" "$C_GREEN" "$cmd" "$C_OFF" "$C_DIM" "$DISTRO_NAME" "$C_OFF" >&2
@@ -374,9 +410,6 @@ WHY
       printf '\n'
     else
       printf '\n  Install %s, then run the same command again.\n' "$what" >&2
-      case "$missing" in *minisign*)
-        printf '  To skip the signature and rely on the sha256 checksum alone, add %s--skip-signature%s.\n' "$C_DIM" "$C_OFF" >&2 ;;
-      esac
       exit 1
     fi
   else
@@ -392,9 +425,6 @@ WHY
       done
       printf '\n' >&2
     fi
-    case "$missing" in *minisign*)
-      printf '  To skip the signature and rely on the sha256 checksum alone, add %s--skip-signature%s.\n' "$C_DIM" "$C_OFF" >&2 ;;
-    esac
     exit 1
   fi
 fi
@@ -422,14 +452,14 @@ fi
 
 # ── The release ──────────────────────────────────────────────────────────
 if [ "$VERSION" = "latest" ]; then
-  step "looking up the latest release" sh -c 'curl -fsSL --connect-timeout 15 --max-time 60 "https://api.github.com/repos/$1/releases/latest" | sed -n "s/.*\"tag_name\": *\"\([^\"]*\)\".*/\1/p" > "$2"' sh "$REPO" "$TMP/tag" \
-    || failstep "could not resolve the latest release from api.github.com"
+  # watchfor.io names the newest release it has verified.
+  step "looking up the latest release" sh -c 'curl -fsSL --connect-timeout 15 --max-time 30 "$1/latest" | tr -d "[:space:]" > "$2" && grep -q "^v[0-9]" "$2"' sh "$RELEASES" "$TMP/tag" \
+    || failstep "could not resolve the latest release from $RELEASES/latest"
   VERSION=$(cat "$TMP/tag")
-  [ -n "$VERSION" ] || fail "could not resolve the latest release"
 fi
 TAG="$VERSION"
 VER="${VERSION#v}"
-BASE="https://github.com/$REPO/releases/download/$TAG"
+BASE="$DOWNLOAD/$TAG"
 TARBALL="watchfor-agent_${VER}_linux_${ARCH}.tar.gz"
 
 # An existing install turns this into an upgrade: same checks, then the
@@ -439,68 +469,60 @@ if [ "$CURRENT" = "$VER" ]; then
   if [ "$REINSTALL" != 1 ] && interactive && ask "  Reinstall it anyway (fresh download of the same version)?" n n; then
     REINSTALL=1
   fi
-  if [ "$REINSTALL" = 1 ] && [ "$VERIFY_BY" = agent ]; then
-    # The installed agent refuses to "upgrade" to the version it already
-    # runs, so a same-version reinstall needs minisign for the check.
-    note "  a reinstall of the same version needs minisign (apt-get install -y minisign) or --skip-signature; skipping the reinstall"
-    REINSTALL=0
-  fi
 elif [ -n "$CURRENT" ]; then
   ok "upgrade: watchfor-agent $C_BOLD$CURRENT $ARROW $VER$C_OFF for linux/$ARCH"
 else
   ok "install: watchfor-agent $C_BOLD$VER$C_OFF for linux/$ARCH"
 fi
 
-# Runs as a separate program (steps live in their own process group), so
-# everything it needs arrives as arguments: tmp dir, release base URL,
-# tarball name, public key, verify mode.
+# Verification, one step (steps live in their own process group, so
+# everything arrives as arguments): the sha256 of the tarball against the
+# checksums watchfor.io served, then the release signature over those
+# checksums, checked by the downloaded agent with its built-in key. The
+# binary is staged next to its final place first — /tmp may be noexec.
+# A reason is left for the caller when it fails.
 VERIFY_SCRIPT='
-tmp=$1; base=$2; tarball=$3; pubkey=$4; mode=$5
-if [ "$mode" = minisign ]; then
-  curl -fsSL --connect-timeout 15 --max-time 60 -o "$tmp/checksums.txt.minisig" "$base/checksums.txt.minisig" \
-    || { echo "could not download the release signature ($base/checksums.txt.minisig)" > "$tmp/reason"; exit 1; }
-  minisign -Vm "$tmp/checksums.txt" -P "$pubkey" \
-    || { echo "signature verification failed: checksums.txt is not signed by the WatchFor release key" > "$tmp/reason"; exit 1; }
-fi
+tmp=$1; base=$2; tarball=$3; bin=$4
 (cd "$tmp" && grep " $tarball\$" checksums.txt | sha256sum -c --quiet) \
-  || { echo "checksum mismatch: $tarball does not match the signed checksums.txt" > "$tmp/reason"; exit 1; }
+  || { echo "checksum mismatch: $tarball does not match the checksums watchfor.io serves" > "$tmp/reason"; exit 1; }
+curl -fsSL --connect-timeout 15 --max-time 60 -o "$tmp/checksums.txt.minisig" "$base/checksums.txt.minisig" \
+  || { echo "could not download the release signature ($base/checksums.txt.minisig)" > "$tmp/reason"; exit 1; }
+tar -xzf "$tmp/$tarball" -C "$tmp" watchfor-agent packaging/watchfor-agent.service \
+  || { echo "could not extract $tarball" > "$tmp/reason"; exit 1; }
+install -m 0755 "$tmp/watchfor-agent" "$bin.new" \
+  || { echo "could not stage the binary next to $bin" > "$tmp/reason"; exit 1; }
+"$bin.new" verify -q -checksums "$tmp/checksums.txt" -sig "$tmp/checksums.txt.minisig" "$tmp/$tarball" \
+  || { rm -f "$bin.new"; echo "signature verification failed: the release is not signed by the WatchFor key" > "$tmp/reason"; exit 1; }
 '
 
 if [ "$CURRENT" != "$VER" ] || [ "$REINSTALL" = 1 ]; then
-  if [ "$VERIFY_BY" = agent ]; then
-    note "  minisign is not installed; the installed agent ($CURRENT) verifies the release with its built-in key"
-    step "downloading and verifying watchfor-agent $VER" "$BIN" upgrade -version "$VER" -no-restart \
-      || failstep "upgrade failed; nothing was replaced"
-    ok "verified signature and sha256, installed $BIN"
+  if [ "$TTY" = 1 ]; then
+    # curl draws its own progress bar on a terminal; both lines are then
+    # replaced by the one-line result.
+    printf '%s%s%s downloading %s\n' "$C_CYAN" "$I_DOWN" "$C_OFF" "$TARBALL"
+    if curl -fL -# --connect-timeout 15 --max-time 600 -o "$TMP/$TARBALL" "$BASE/$TARBALL"; then
+      # curl ends its bar with a newline: clear that line, the bar, the label.
+      printf '\r%s\033[1A\r%s\033[1A\r%s' "$CLR" "$CLR" "$CLR"
+    else
+      printf '\n'; fail "could not download $BASE/$TARBALL"
+    fi
   else
-    if [ "$TTY" = 1 ]; then
-      # curl draws its own progress bar on a terminal; both lines are then
-      # replaced by the one-line result.
-      printf '%s%s%s downloading %s\n' "$C_CYAN" "$I_DOWN" "$C_OFF" "$TARBALL"
-      if curl -fL -# --connect-timeout 15 --max-time 600 -o "$TMP/$TARBALL" "$BASE/$TARBALL"; then
-        # curl ends its bar with a newline: clear that line, the bar, the label.
-        printf '\r%s\033[1A\r%s\033[1A\r%s' "$CLR" "$CLR" "$CLR"
-      else
-        printf '\n'; fail "could not download $BASE/$TARBALL"
-      fi
-    else
-      curl -fsSL --connect-timeout 15 --max-time 600 -o "$TMP/$TARBALL" "$BASE/$TARBALL" || fail "could not download $BASE/$TARBALL"
-    fi
-    size=$(wc -c < "$TMP/$TARBALL" | awk '{printf "%.1f MB", $1/1048576}')
-    ok "downloaded $TARBALL ${C_DIM}($size)$C_OFF"
-    step "fetching the signed checksums" curl -fsSL --connect-timeout 15 --max-time 60 -o "$TMP/checksums.txt" "$BASE/checksums.txt" \
-      || failstep "could not download $BASE/checksums.txt"
-    if [ "$VERIFY_BY" = none ]; then
-      step "verifying the sha256 checksum" sh -c "$VERIFY_SCRIPT" sh "$TMP" "$BASE" "$TARBALL" "$PUBKEY" "$VERIFY_BY" || fail "$(cat "$TMP/reason" 2>/dev/null || echo "verification failed")"
-      ok "verified sha256 ${C_DIM}(signature check skipped: --skip-signature)$C_OFF"
-    else
-      step "verifying the release signature and checksum" sh -c "$VERIFY_SCRIPT" sh "$TMP" "$BASE" "$TARBALL" "$PUBKEY" "$VERIFY_BY" || fail "$(cat "$TMP/reason" 2>/dev/null || echo "verification failed")"
-      ok "verified signature and sha256"
-    fi
-    step "installing $BIN" sh -c 'tar -xzf "$1" -C "$2" watchfor-agent && install -m 0755 "$2/watchfor-agent" "$3"' sh "$TMP/$TARBALL" "$TMP" "$BIN" \
-      || failstep "could not install $BIN"
-    ok "installed $BIN"
+    curl -fsSL --connect-timeout 15 --max-time 600 -o "$TMP/$TARBALL" "$BASE/$TARBALL" || fail "could not download $BASE/$TARBALL"
   fi
+  size=$(wc -c < "$TMP/$TARBALL" | awk '{printf "%.1f MB", $1/1048576}')
+  ok "downloaded $TARBALL ${C_DIM}($size)$C_OFF"
+  # The checksums come from watchfor.io, which serves them only after
+  # verifying the release signature: a file swapped on GitHub cannot pass.
+  step "fetching the release checksums from watchfor.io" curl -fsSL --connect-timeout 15 --max-time 60 -o "$TMP/checksums.txt" "$RELEASES/checksums/$TAG.txt" \
+    || failstep "could not download $RELEASES/checksums/$TAG.txt"
+  step "verifying the sha256 and the release signature" sh -c "$VERIFY_SCRIPT" sh "$TMP" "$BASE" "$TARBALL" "$BIN" \
+    || fail "$(cat "$TMP/reason" 2>/dev/null || echo "verification failed")"
+  ok "verified sha256 (checksums from watchfor.io) and release signature ${C_DIM}(agent built-in key)$C_OFF"
+  verify_state="sha256 via watchfor.io + signature (agent key)"
+  # The verified, staged binary takes its place; the unit that shipped in
+  # the same tarball is installed further down.
+  step "installing $BIN" mv -f "$BIN.new" "$BIN" || failstep "could not install $BIN"
+  ok "installed $BIN"
 fi
 
 # ── User, directories, token, config ─────────────────────────────────────
@@ -542,31 +564,20 @@ if [ -z "$AUTO_UPDATE" ]; then
 fi
 
 # ── systemd ──────────────────────────────────────────────────────────────
-RAW="https://raw.githubusercontent.com/$REPO/$TAG/packaging"
 step "installing the systemd service" sh -c '
-  curl -fsSL --connect-timeout 15 --max-time 60 -o /etc/systemd/system/watchfor-agent.service "$1/watchfor-agent.service"
+  unit=/etc/systemd/system/watchfor-agent.service
+  # the unit ships in the verified tarball; an unchanged install keeps its own
+  [ ! -f "$1/packaging/watchfor-agent.service" ] || install -m 0644 "$1/packaging/watchfor-agent.service" "$unit"
+  [ -f "$unit" ] || { echo "no unit file: $unit" >&2; exit 1; }
   systemctl daemon-reload
   systemctl enable -q --now watchfor-agent
-  [ -z "$2" ] || [ "$2" = "$3" ] || systemctl try-restart watchfor-agent' sh "$RAW" "$CURRENT" "$VER" \
+  [ -z "$2" ] || [ "$2" = "$3" ] || systemctl try-restart watchfor-agent' sh "$TMP" "$CURRENT" "$VER" \
   || failstep "could not enable the systemd service"
-# Auto-update: the agent itself owns the timer and the updates.auto line
-# in agent.yml from 0.4.0; an older release gets the units from the tag.
+# Auto-update: the agent owns the timer and the updates.auto line in agent.yml.
 case "$AUTO_UPDATE" in
   1|0)
-    if ver_ge "$VER" "$AUTO_UPDATE_CLI_SINCE"; then
-      if [ "$AUTO_UPDATE" = 1 ]; then _au=on; else _au=off; fi
-      step "turning auto-update $_au" "$BIN" auto-update "$_au" -config "$ETC/agent.yml" || failstep "could not turn auto-update $_au"
-    else
-      step "configuring auto-update ($AUTO_UPDATE)" sh -c '
-        case "$2" in
-          1) curl -fsSL --connect-timeout 15 --max-time 60 -o /etc/systemd/system/watchfor-agent-update.service "$1/watchfor-agent-update.service"
-             curl -fsSL --connect-timeout 15 --max-time 60 -o /etc/systemd/system/watchfor-agent-update.timer "$1/watchfor-agent-update.timer"
-             systemctl daemon-reload; systemctl enable -q --now watchfor-agent-update.timer ;;
-          0) systemctl disable -q --now watchfor-agent-update.timer 2>/dev/null || true
-             rm -f /etc/systemd/system/watchfor-agent-update.timer /etc/systemd/system/watchfor-agent-update.service
-             systemctl daemon-reload ;;
-        esac' sh "$RAW" "$AUTO_UPDATE" || failstep "could not configure auto-update"
-    fi ;;
+    if [ "$AUTO_UPDATE" = 1 ]; then _au=on; else _au=off; fi
+    step "turning auto-update $_au" "$BIN" auto-update "$_au" -config "$ETC/agent.yml" || failstep "could not turn auto-update $_au" ;;
 esac
 if [ -n "$CURRENT" ] && [ "$CURRENT" != "$VER" ]; then
   ok "service restarted on watchfor-agent $VER"
@@ -574,7 +585,7 @@ if [ -n "$CURRENT" ] && [ "$CURRENT" != "$VER" ]; then
 elif [ "$REINSTALL" = 1 ]; then
   systemctl try-restart watchfor-agent
   ok "reinstalled watchfor-agent $VER and restarted the service"
-  service_state="watchfor-agent, reinstalled and restarted, runs as user watchfor-agent"
+  service_state="reinstalled and restarted, runs as user watchfor-agent"
 else
   ok "service enabled and running"
   service_state="watchfor-agent, running as user watchfor-agent"
@@ -583,7 +594,7 @@ if systemctl is-enabled -q watchfor-agent-update.timer 2>/dev/null; then
   ok "auto-update on: a newer signed release the server reports is installed daily"
   update_state="on, daily (watchfor-agent-update.timer)"
 else
-  update_state="off: sudo watchfor-agent upgrade, or re-run with --auto-update"
+  update_state="off — sudo watchfor-agent upgrade, or --auto-update"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────
@@ -596,6 +607,7 @@ printf '\n%s%s%s%s%s%s%s' "$C_DIM" "$B_TL" "$B_H" "$C_OFF" "$C_BOLD$C_GREEN" "$t
 printf '%s%s%s%s\n' "$C_DIM" "$(rule $((W + 15 - tlen)))" "$B_TR" "$C_OFF"
 line "service" "$service_state"
 line "config" "$ETC/agent.yml"
+[ -z "${verify_state:-}" ] || line "verified" "$verify_state"
 line "auto-update" "$update_state"
 line "status" "systemctl status watchfor-agent"
 line "logs" "journalctl -u watchfor-agent -f"

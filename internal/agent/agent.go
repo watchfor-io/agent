@@ -161,7 +161,7 @@ func (a *Agent) rejected(err error, body []byte) error {
 	}
 	a.o.Log.Warn("token rejected by the server; will try again",
 		"error", err, "attempt", rec.Count, "of", StickyRejections, "retry_in", wait.String(),
-		"note", "if the host was removed in WatchFor or its token rotated, the agent stops by itself after "+StickySpan.String())
+		"note", "if the host was removed in WatchFor or its token rotated, the agent stops by itself once the rejection has held for over "+StickySpan.String())
 	return nil
 }
 

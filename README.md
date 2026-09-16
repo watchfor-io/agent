@@ -15,18 +15,24 @@ Linux only for now (amd64, arm64). Windows is planned; macOS is not.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/watchfor-io/agent/main/packaging/install.sh \
-  | sudo sh -s -- --token <host-token>
+curl -fsSL https://watchfor.io/agent/install.sh | sudo sh -s -- --token <host-token>
 ```
 
-The script downloads the release for your architecture, verifies the
-checksum (and the minisign signature when `minisign` is installed), creates
-the unprivileged `watchfor-agent` user, writes the token to
+The script downloads the release for your architecture, verifies it,
+creates the unprivileged `watchfor-agent` user, writes the token to
 `/etc/watchfor-agent/token` with mode 0600 and enables the systemd unit.
 The host token comes from the WatchFor dashboard, one per host.
 
-It needs root, systemd, `curl`, `tar`, `sha256sum`, `useradd` and
-`minisign` — all checked before anything is touched. A missing tool does
+It needs no packages for the verification. The tarball comes from GitHub
+(storage only); the checksums it is checked against come from watchfor.io,
+which serves a release's `checksums.txt` only after verifying the release
+signature on its side — so a file swapped on GitHub cannot pass. The
+downloaded agent then verifies the release signature itself with the key
+built into it (`watchfor-agent verify`). The script itself is served by
+watchfor.io from the newest release, covered by the same signed checksums.
+
+It needs root, systemd, `curl`, `tar`, `sha256sum` and `useradd` — all
+checked before anything is touched. A missing tool does
 not end the script halfway through: on a terminal, run with sudo, it
 shows the one install command for your distribution and offers to run it
 (`--yes` skips the question); otherwise it prints that command and stops.
@@ -47,15 +53,9 @@ Prefer to keep the token out of `ps` and your shell history: pass
 it; `WATCHFOR_TOKEN=…` in the environment works for automation.
 Progress, colours and the summary box appear only on a terminal; `--plain`
 (or `NO_COLOR=1`) keeps the output to plain lines for logs and CI. The release signature is verified by default. Once an
-agent 0.3.0 or newer is installed, upgrades no longer need minisign: the
-installed agent verifies the release with the key built into it. On a box
-where you would rather not install minisign at all, `--skip-signature`
-trusts the sha256 checksum alone:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/watchfor-io/agent/main/packaging/install.sh \
-  | sudo sh -s -- --token <host-token> --skip-signature
-```
+agent is installed, the same command upgrades it: the new release is
+downloaded, verified and swapped in, and the service restarted; token and
+`agent.yml` stay.
 
 Prefer to look before you run? Download the tarball from the releases page,
 put the binary anywhere, and run it by hand:
@@ -71,17 +71,20 @@ thing you can do with the binary is see exactly what it would report.
 
 ### Verify a release
 
-Every release ships `checksums.txt` and its minisign signature.
+Every release ships `checksums.txt` and its signature (`checksums.txt.minisig`,
+made in CI with the WatchFor release key). The agent checks both with the
+key built into it:
 
 ```sh
-sha256sum -c --ignore-missing checksums.txt
-minisign -Vm checksums.txt -P RWTUApo01PH7RyjD76wN2Vu7l5sO7Ys5psNQE9I7QYdWVfWSf0CetQje
+tar -xzf watchfor-agent_0.5.0_linux_amd64.tar.gz watchfor-agent
+./watchfor-agent verify -checksums checksums.txt watchfor-agent_0.5.0_linux_amd64.tar.gz
 ```
 
-The install script does both (the signature when `minisign` is on the
-machine). Binaries are static, built from the tag by GoReleaser with
-`CGO_ENABLED=0 -trimpath`, so a build from the same tag on your own machine
-produces the same binary.
+The signature is in minisign format, so `minisign -Vm checksums.txt -P
+RWTUApo01PH7RyjD76wN2Vu7l5sO7Ys5psNQE9I7QYdWVfWSf0CetQje` checks it from
+the outside too. Binaries are static, built from the tag by GoReleaser
+with `CGO_ENABLED=0 -trimpath`, so a build from the same tag on your own
+machine produces the same binary.
 
 ### Install by hand
 
@@ -133,11 +136,20 @@ sudo cp packaging/watchfor-agent.cron /etc/cron.d/watchfor-agent
 ### Uninstall
 
 ```sh
-sudo systemctl disable --now watchfor-agent
-sudo rm -f /etc/systemd/system/watchfor-agent.service /etc/cron.d/watchfor-agent /usr/local/bin/watchfor-agent
-sudo rm -rf /etc/watchfor-agent /var/lib/watchfor-agent
-sudo userdel watchfor-agent
+sudo watchfor-agent uninstall          # shows what it found and asks; -yes to skip, -keep-config to leave agent.yml
 ```
+
+Without the binary, the installer does the same:
+
+```sh
+curl -fsSL https://watchfor.io/agent/install.sh | sudo sh -s -- --uninstall
+```
+
+Both stop and remove the service and the update timer, the cron entry, the
+state directory, the config directory (the token file is overwritten before
+it is deleted), the `watchfor-agent` system user and the binary. Only
+directories called `watchfor-agent` are removed recursively: a `spool.dir`
+under another name is reported and left to you.
 
 Remove the host in the dashboard as well; that revokes the token and deletes
 its history.
@@ -156,9 +168,11 @@ sudo watchfor-agent upgrade -check     # only report; exit 10 if one is availabl
 sudo watchfor-agent upgrade -version 0.3.0
 ```
 
-`upgrade` downloads the release from github.com/watchfor-io/agent over
-HTTPS (only GitHub's release hosts are accepted, redirects included),
-verifies `checksums.txt` against the minisign key built into the binary —
+`upgrade` asks watchfor.io which release is current (or takes the version
+the server reported to the running agent), downloads the files from
+github.com/watchfor-io/agent over HTTPS (only watchfor.io and GitHub's
+release hosts are accepted, redirects included), verifies `checksums.txt`
+against the release key built into the binary —
 the same key as above — checks the archive's sha256 against that signed
 file, runs the new binary once to confirm it reports the expected version,
 swaps it in with an atomic rename and restarts the service. It refuses to
@@ -169,8 +183,7 @@ job with the same checks and keeps the token and `agent.yml`.
 Hosts that should keep themselves current can opt in to a daily timer:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/watchfor-io/agent/main/packaging/install.sh \
-  | sudo sh -s -- --auto-update        # --no-auto-update removes it again
+curl -fsSL https://watchfor.io/agent/install.sh | sudo sh -s -- --auto-update        # --no-auto-update removes it again
 ```
 
 The timer (`watchfor-agent-update.timer`, once a day with up to six hours

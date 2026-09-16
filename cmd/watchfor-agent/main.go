@@ -6,6 +6,8 @@
 //	watchfor-agent check    print what would be sent, no network
 //	watchfor-agent upgrade  install a newer signed release, restart the service
 //	watchfor-agent auto-update on|off|status
+//	watchfor-agent uninstall  remove everything the installer put on the machine
+//	watchfor-agent verify     check a downloaded release against the built-in key
 //	watchfor-agent config get|set|keys|path
 //	watchfor-agent version
 package main
@@ -57,11 +59,14 @@ func main() {
 
 func run(args []string) int {
 	if len(args) == 0 {
-		usage()
+		usage(os.Stderr)
 		return exitUsage
 	}
 	cmd, args := args[0], args[1:]
 	switch cmd {
+	case "help", "-h", "--help", "-help":
+		usage(os.Stdout)
+		return exitOK
 	case "version", "-version", "--version":
 		fmt.Println("watchfor-agent " + Version)
 		return exitOK
@@ -71,9 +76,14 @@ func run(args []string) int {
 		return runAutoUpdate(args)
 	case "config":
 		return runConfig(args)
+	case "uninstall":
+		return runUninstall(args)
+	case "verify":
+		return runVerify(args)
 	case "run", "once", "check":
 	default:
-		usage()
+		fmt.Fprintf(os.Stderr, "watchfor-agent: unknown command %q\n\n", cmd)
+		usage(os.Stderr)
 		return exitUsage
 	}
 
@@ -237,15 +247,40 @@ func envOr(key, def string) string {
 	return def
 }
 
-func usage() {
-	fmt.Fprintf(os.Stderr, `usage: watchfor-agent <command> [-config %s]
-
-  run      collect on the configured interval and push (the systemd service)
-  once     collect once, push once, exit — for cron
-  check    collect once and print the batch that would be sent; no network
-  upgrade      install a newer signed release (root); -check only reports
-  auto-update  on|off|status — daily signed updates via a systemd timer (root)
-  config       get|set|keys|path — read or change one setting in agent.yml
-  version
-`, defaultConfig)
+// usage prints the command reference: to stdout for `help`, to stderr
+// when the command line made no sense. Colour only on a terminal that
+// wants it (NO_COLOR and TERM=dumb switch it off).
+func usage(w *os.File) {
+	bold, dim, cmd, off := "", "", "", ""
+	if st, err := w.Stat(); err == nil && st.Mode()&os.ModeCharDevice != 0 &&
+		os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb" {
+		bold, dim, cmd, off = "\033[1m", "\033[2m", "\033[36m", "\033[0m"
+	}
+	head := func(s string) string { return bold + s + off }
+	row := func(name, text string) string { return fmt.Sprintf("  %s%-13s%s %s\n", cmd, name, off, text) }
+	note := func(s string) string { return dim + s + off }
+	fmt.Fprint(w,
+		head("watchfor-agent "+Version)+" — the WatchFor host agent\n",
+		note("  Collects CPU, memory, disk, network and process metrics from this server and\n  pushes them to WatchFor over HTTPS. Docs: https://watchfor.io/docs/hosts")+"\n\n",
+		head("Usage")+"\n",
+		"  watchfor-agent <command> [options]\n\n",
+		head("Collect")+"\n",
+		row("run", "Collect on the configured interval and push — what the systemd service runs"),
+		row("once", "Collect once, push once, exit — for cron"),
+		row("check", "Collect once and print the batch that would be sent — no network, no token"),
+		"\n"+head("Maintain")+" "+note("(root)")+"\n",
+		row("upgrade", "Install a newer signed release and restart the service"),
+		row("", note("-check reports only · -version X.Y.Z picks a release · -if-available acts on the server's hint")),
+		row("auto-update", "on | off | status — daily signed updates through a systemd timer"),
+		row("uninstall", "Remove the service, timer, binary, state, config with the token, and the user"),
+		row("", note("-yes skips the question · -keep-config leaves /etc/watchfor-agent in place")),
+		"\n"+head("Inspect")+"\n",
+		row("config", "get | set | keys | path — read or change one setting in agent.yml"),
+		row("verify", "Check a release's checksums.txt signature (built-in key) and file sha256s"),
+		row("version", "Print the version"),
+		"\n"+head("Options")+"\n",
+		fmt.Sprintf("  %-15s agent.yml to use %s\n", "-config <path>", note("(default "+defaultConfig+"; env WATCHFOR_AGENT_CONFIG)")),
+		"\n"+head("Exit codes")+"\n",
+		note("  0 ok · 1 error · 2 usage · 3 token rejected by the server · 10 update available (upgrade -check)")+"\n",
+	)
 }

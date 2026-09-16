@@ -17,10 +17,13 @@ import (
 // the block by itself.
 const RejectedMarker = "token-rejected"
 
-// Sticky after this many rejections spread over at least this long.
+// Sticky after this many rejections spread over at least this long. The
+// retry gaps grow to an hour, so a token has to be refused for close to
+// two hours before the agent gives up: long enough to roll back a bad
+// deploy of ours before a fleet stops itself.
 const (
-	StickyRejections = 3
-	StickySpan       = 10 * time.Minute
+	StickyRejections = 5
+	StickySpan       = time.Hour
 )
 
 // Rejection is the recorded state for one token fingerprint.
@@ -35,15 +38,20 @@ func (r Rejection) Sticky() bool {
 	return r.Count >= StickyRejections && r.Last.Sub(r.First) >= StickySpan
 }
 
-// Backoff is how long the daemon waits before trying the token again.
+// Backoff is how long the daemon waits before trying the token again:
+// 1, 5, 15, 30 minutes, then an hour.
 func (r Rejection) Backoff() time.Duration {
 	switch {
 	case r.Count <= 1:
 		return time.Minute
 	case r.Count == 2:
 		return 5 * time.Minute
+	case r.Count == 3:
+		return 15 * time.Minute
+	case r.Count == 4:
+		return 30 * time.Minute
 	}
-	return 10 * time.Minute
+	return time.Hour
 }
 
 // ReadRejection returns the record for fingerprint; ok is false when

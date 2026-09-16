@@ -3,45 +3,59 @@ package update
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
 
-// DefaultRepo is the GitHub repository releases are published from.
-const DefaultRepo = "watchfor-io/agent"
+// DefaultRepo is the GitHub repository releases are published from — the
+// storage for release files. Which release is current is watchfor.io's
+// word (DefaultReleasesURL), never GitHub's.
+const (
+	DefaultRepo        = "watchfor-io/agent"
+	DefaultReleasesURL = "https://watchfor.io/agent"
+)
 
-// Source fetches release assets. Every request — and every redirect — must
-// be HTTPS to one of Hosts; a release page that sends the client anywhere
-// else is treated as an attack, not followed.
+// Source fetches release files. Every request — and every redirect — must
+// be HTTPS to one of Hosts; a page that sends the client anywhere else is
+// treated as an attack, not followed. Files are verified after download
+// (signature with the built-in key, then sha256), so the hosts only need
+// to be ours or GitHub's, not trusted.
 type Source struct {
-	Repo     string
-	API      string // https://api.github.com
-	Releases string // https://github.com
-	Hosts    []string
-	Client   *http.Client
+	Repo        string
+	Releases    string // https://github.com — release files
+	ReleasesURL string // https://watchfor.io/agent — /latest
+	Hosts       []string
+	Client      *http.Client
 
 	insecure bool // tests: allow plain http to a local server
 }
 
-// NewSource is the production source: GitHub over TLS 1.2+, system roots,
-// at most five redirects, all within GitHub's asset hosts.
+// NewSource is the production source: TLS 1.2+, system roots, at most
+// five redirects, all within watchfor.io and GitHub's file hosts.
+// WATCHFOR_RELEASES_URL points a staging agent at a staging site.
 func NewSource() *Source {
 	s := &Source{
-		Repo:     DefaultRepo,
-		API:      "https://api.github.com",
-		Releases: "https://github.com",
+		Repo:        DefaultRepo,
+		Releases:    "https://github.com",
+		ReleasesURL: DefaultReleasesURL,
 		Hosts: []string{
-			"api.github.com",
+			"watchfor.io",
 			"github.com",
 			"objects.githubusercontent.com",
 			"release-assets.githubusercontent.com",
 		},
+	}
+	if v := os.Getenv("WATCHFOR_RELEASES_URL"); v != "" {
+		if u, err := url.Parse(v); err == nil && u.Hostname() != "" {
+			s.ReleasesURL = strings.TrimRight(v, "/")
+			s.Hosts = append(s.Hosts, strings.ToLower(u.Hostname()))
+		}
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
@@ -104,25 +118,18 @@ func (s *Source) get(ctx context.Context, rawURL, accept string, max int64) ([]b
 	return body, nil
 }
 
-// Latest asks the API for the newest published (non-draft, non-pre)
-// release and returns its version without the "v".
+// Latest asks watchfor.io for the newest release it has verified and
+// returns its version without the "v".
 func (s *Source) Latest(ctx context.Context) (string, error) {
-	body, err := s.get(ctx, s.API+"/repos/"+s.Repo+"/releases/latest", "application/vnd.github+json", 1<<20)
+	body, err := s.get(ctx, s.ReleasesURL+"/latest", "text/plain", 1<<10)
 	if err != nil {
 		return "", fmt.Errorf("latest release: %w", err)
 	}
-	var rel struct {
-		TagName    string `json:"tag_name"`
-		Draft      bool   `json:"draft"`
-		Prerelease bool   `json:"prerelease"`
+	tag := strings.TrimSpace(string(body))
+	if !strings.HasPrefix(tag, "v") {
+		return "", fmt.Errorf("latest release: unexpected answer %q", tag)
 	}
-	if err := json.Unmarshal(body, &rel); err != nil {
-		return "", fmt.Errorf("latest release: %w", err)
-	}
-	if rel.Draft || rel.Prerelease || !strings.HasPrefix(rel.TagName, "v") {
-		return "", fmt.Errorf("latest release: unexpected tag %q", rel.TagName)
-	}
-	v, err := Parse(rel.TagName)
+	v, err := Parse(tag)
 	if err != nil {
 		return "", fmt.Errorf("latest release: %w", err)
 	}

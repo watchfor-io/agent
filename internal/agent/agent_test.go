@@ -129,17 +129,17 @@ func TestUnauthorizedStopsOnlyWhenItSticks(t *testing.T) {
 	if err := a.tick(ctx); err != nil || sink.calls != calls {
 		t.Fatalf("paused agent asked the server (calls %d→%d, err %v)", calls, sink.calls, err)
 	}
-	now = now.Add(2 * time.Minute) // rejection 2 at +2m30s
-	if err := a.tick(ctx); err != nil {
-		t.Fatalf("second rejection must not stop the agent: %v", err)
+	// Rejections 2–5 at the daemon's own pace (backoff 1, 5, 15, 30 min):
+	// none of them stops the agent, even though the last is 51 minutes in.
+	for _, step := range []time.Duration{2, 6, 16, 31} {
+		now = now.Add(step * time.Minute)
+		if err := a.tick(ctx); err != nil {
+			t.Fatalf("rejection at +%v must not stop the agent: %v", now.Sub(time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)), err)
+		}
 	}
-	now = now.Add(6 * time.Minute) // rejection 3 at +8m30s: three rejections, but under ten minutes
-	if err := a.tick(ctx); err != nil {
-		t.Fatalf("three rejections within ten minutes must not stop the agent: %v", err)
-	}
-	now = now.Add(11 * time.Minute) // rejection 4 at +19m30s: sticky
+	now = now.Add(61 * time.Minute) // rejection 6 at ~+1h56m: held for over an hour, sticky
 	if err := a.tick(ctx); !errors.Is(err, ErrTokenRejected) {
-		t.Fatalf("a rejection held for 19 minutes should stop the agent, got %v", err)
+		t.Fatalf("a rejection held for almost two hours should stop the agent, got %v", err)
 	}
 	if rec, ok := ReadRejection(a.o.StateDir, "fp1"); !ok || !rec.Sticky() {
 		t.Fatalf("record not sticky on disk: %+v %v", rec, ok)

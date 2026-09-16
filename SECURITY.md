@@ -24,8 +24,20 @@ rewritten one.
   an empty capability set, `NoNewPrivileges`, a memory cap and a task cap.
 - `host.id` is a hash of `/etc/machine-id`, not the id itself.
 - Releases are static binaries built from the tag by GoReleaser; the
-  `checksums.txt` is signed with minisign. The public key is in
-  `packaging/install.sh` and in the README.
+  `checksums.txt` is signed (Ed25519, minisign format) in CI. The public
+  key is compiled into the agent (`internal/update/minisign.go`) and
+  printed in the README; nothing on a customer's machine needs the
+  minisign tool.
+- The one-line installer (`https://watchfor.io/agent/install.sh`) needs no
+  verification tools on the machine and has no skip switch. The script and a release's
+  `checksums.txt` are served by watchfor.io only after the release
+  signature verified there; the tarball comes from GitHub and is checked
+  against those checksums, so a file replaced on GitHub alone cannot pass
+  and a forged watchfor.io alone has no tarball to serve. The downloaded
+  agent then verifies the release signature itself with its built-in key
+  (`watchfor-agent verify`). A first install therefore rests on TLS to
+  watchfor.io, which is also what delivered the install command; from then
+  on, the installed agent's key does the checking and no server is trusted.
 - `watchfor-agent upgrade` installs only a release whose `checksums.txt`
   carries a valid signature by that key (the key is compiled into the
   binary), whose archive matches the signed checksum, and whose binary

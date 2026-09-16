@@ -16,7 +16,7 @@ import (
 // release whose checksums file is signed by the WatchFor key, then restart
 // the service. Needs write access to the binary, so root in practice.
 //
-//	upgrade                 latest version the server reported, else GitHub
+//	upgrade                 latest version the server reported, else watchfor.io
 //	upgrade -version 0.3.0  that release exactly
 //	upgrade -check          report only; exit 10 when an update is available
 //	upgrade -if-available   only if the running agent recorded a hint (timer)
@@ -25,7 +25,7 @@ func runUpgrade(args []string) int {
 	configPath := fs.String("config", envOr("WATCHFOR_AGENT_CONFIG", defaultConfig), "path to agent.yml (for the state directory)")
 	version := fs.String("version", "", "install this release instead of the newest")
 	check := fs.Bool("check", false, "report whether an update is available; exit 10 if so")
-	ifAvailable := fs.Bool("if-available", false, "act only on the running agent's hint; never ask GitHub")
+	ifAvailable := fs.Bool("if-available", false, "act only on the running agent's hint; never ask watchfor.io")
 	noRestart := fs.Bool("no-restart", false, "do not restart the systemd service afterwards")
 	allowDowngrade := fs.Bool("allow-downgrade", false, "permit a lower version than the running one")
 	if err := fs.Parse(args); err != nil {

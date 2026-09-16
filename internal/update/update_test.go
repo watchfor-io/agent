@@ -207,9 +207,9 @@ func newRelease(t *testing.T, s *signer, version string, script string, tamper f
 		name:                    archive,
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/repos/watchfor-io/agent/releases/latest", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("/agent/latest", func(w http.ResponseWriter, req *http.Request) {
 		r.hits = append(r.hits, req.URL.Path)
-		w.Write([]byte(`{"tag_name":"v` + version + `","draft":false,"prerelease":false}`))
+		w.Write([]byte("v" + version + "\n"))
 	})
 	mux.HandleFunc("/watchfor-io/agent/releases/download/v"+version+"/", func(w http.ResponseWriter, req *http.Request) {
 		r.hits = append(r.hits, req.URL.Path)
@@ -228,7 +228,7 @@ func newRelease(t *testing.T, s *signer, version string, script string, tamper f
 	})
 	r.srv = httptest.NewServer(mux)
 	t.Cleanup(r.srv.Close)
-	r.source = &Source{Repo: DefaultRepo, API: r.srv.URL, Releases: r.srv.URL, Hosts: []string{"127.0.0.1"}, insecure: true}
+	r.source = &Source{Repo: DefaultRepo, Releases: r.srv.URL, ReleasesURL: r.srv.URL + "/agent", Hosts: []string{"127.0.0.1"}, insecure: true}
 	r.source.Client = &http.Client{CheckRedirect: r.source.checkRedirect}
 	return r
 }
@@ -291,8 +291,8 @@ func TestRunUpgrades(t *testing.T) {
 		t.Fatal("hint not cleared after upgrade")
 	}
 	for _, h := range r.hits {
-		if strings.Contains(h, "releases/latest") {
-			t.Fatal("asked GitHub although the server had reported a version")
+		if strings.HasSuffix(h, "/latest") {
+			t.Fatal("asked watchfor.io although the server had reported a version")
 		}
 	}
 	if entries, _ := os.ReadDir(filepath.Dir(o.ExePath)); len(entries) != 1 {
@@ -375,10 +375,10 @@ func TestRunPolicies(t *testing.T) {
 	if _, err := Run(context.Background(), o); err == nil || !strings.Contains(err.Error(), "development build") {
 		t.Fatalf("dev build resolved implicitly: %v", err)
 	}
-	// Check resolves via GitHub when there is no hint.
+	// Check asks watchfor.io when there is no hint.
 	o = testOptions(t, r, s, "0.0.1")
 	st, err := Check(context.Background(), o)
-	if err != nil || !st.Available || st.Origin != "github" || st.Latest != "0.1.0" {
+	if err != nil || !st.Available || st.Origin != "watchfor.io" || st.Latest != "0.1.0" {
 		t.Fatalf("Check: %+v, %v", st, err)
 	}
 }

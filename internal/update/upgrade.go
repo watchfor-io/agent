@@ -64,7 +64,7 @@ type Options struct {
 type Status struct {
 	Current   string
 	Latest    string // "" when nothing is known
-	Origin    string // "explicit", "server", "github" or "none"
+	Origin    string // "explicit", "server", "watchfor.io" or "none"
 	Available bool
 }
 
@@ -104,7 +104,7 @@ func (o Options) withDefaults() Options {
 
 // Resolve decides which version to install: an explicit Target, else the
 // version the server reported to the daemon, else (unless IfAvailable)
-// the newest release on GitHub. An empty target means "nothing to do".
+// the newest release watchfor.io names. An empty target means "nothing to do".
 func Resolve(ctx context.Context, o Options) (target, origin string, err error) {
 	o = o.withDefaults()
 	if o.Target != "" {
@@ -124,7 +124,7 @@ func Resolve(ctx context.Context, o Options) (target, origin string, err error) 
 	if err != nil {
 		return "", "", err
 	}
-	return v, "github", nil
+	return v, "watchfor.io", nil
 }
 
 // Check compares the running version with the resolved target.

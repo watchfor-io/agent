@@ -16,6 +16,10 @@ archives:
 checksum:
   name_template: checksums.txt
   algorithm: sha256
+  # install.sh ships as a release asset and is covered by the signed
+  # checksums: watchfor.io serves the copy it verified against them.
+  extra_files:
+    - glob: ./packaging/install.sh
 # The checksums file is signed with minisign; the public key is in
 # packaging/install.sh and in the README. The secret key lives only in the
 # release workflow's secret (and Vault).
@@ -42,13 +46,19 @@ changelog:
 release:
   draft: false
   name_template: "watchfor-agent {{ .Version }}"
+  extra_files:
+    - glob: ./packaging/install.sh
   header: |
     ## Install
 
     ```sh
-    curl -fsSL https://raw.githubusercontent.com/watchfor-io/agent/main/packaging/install.sh \
-      | sudo sh -s -- --token <host-token>
+    curl -fsSL https://watchfor.io/agent/install.sh | sudo sh -s -- --token <host-token>
     ```
+
+    No packages needed: the installer checks the tarball's sha256 against the
+    checksums watchfor.io serves (signature-verified there), and the agent
+    verifies the release signature with its built-in key
+    (`watchfor-agent verify`).
 
     Or download the tarball for your architecture below, verify it, and run the
     binary by hand — the [README](https://github.com/watchfor-io/agent#install)
@@ -57,9 +67,12 @@ release:
     ## Verify
 
     ```sh
-    sha256sum -c --ignore-missing checksums.txt
-    minisign -Vm checksums.txt -P RWTUApo01PH7RyjD76wN2Vu7l5sO7Ys5psNQE9I7QYdWVfWSf0CetQje
+    tar -xzf watchfor-agent_*_linux_$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/').tar.gz watchfor-agent
+    ./watchfor-agent verify -checksums checksums.txt watchfor-agent_*.tar.gz
     ```
+
+    The signature is Ed25519 in minisign format
+    (`minisign -Vm checksums.txt -P RWTUApo01PH7RyjD76wN2Vu7l5sO7Ys5psNQE9I7QYdWVfWSf0CetQje`).
   footer: |
     Linux amd64 and arm64, static binaries, `CGO_ENABLED=0`, built from the tag
     by GoReleaser. Questions and bugs: https://github.com/watchfor-io/agent/issues

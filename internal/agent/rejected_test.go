@@ -15,24 +15,29 @@ func TestRejectionBecomesStickyOnlyAfterRepeatedRejections(t *testing.T) {
 	if rec.Backoff() != time.Minute {
 		t.Fatalf("backoff after one rejection = %v", rec.Backoff())
 	}
-	rec, _ = RecordRejection(dir, "abc", t0.Add(1*time.Minute))
-	rec, _ = RecordRejection(dir, "abc", t0.Add(6*time.Minute))
-	if rec.Count != 3 || rec.Sticky() {
-		t.Fatalf("three rejections within 6 minutes must not be sticky: %+v", rec)
+	// Follow the backoff the daemon would: 1, 5, 15, 30 min, then hourly.
+	for i, at := range []time.Duration{1, 6, 21, 51} {
+		rec, _ = RecordRejection(dir, "abc", t0.Add(at*time.Minute))
+		if rec.Sticky() {
+			t.Fatalf("rejection %d at +%dm must not be sticky: %+v", i+2, at, rec)
+		}
 	}
-	rec, _ = RecordRejection(dir, "abc", t0.Add(16*time.Minute))
+	if rec.Count != 5 || rec.Backoff() != time.Hour {
+		t.Fatalf("after five rejections: count %d, backoff %v", rec.Count, rec.Backoff())
+	}
+	rec, _ = RecordRejection(dir, "abc", t0.Add(111*time.Minute))
 	if !rec.Sticky() {
-		t.Fatalf("four rejections over 16 minutes should be sticky: %+v", rec)
+		t.Fatalf("six rejections over 1h51m should be sticky: %+v", rec)
 	}
 	got, ok := ReadRejection(dir, "abc")
-	if !ok || got.Count != 4 || !got.First.Equal(t0) {
+	if !ok || got.Count != 6 || !got.First.Equal(t0) {
 		t.Fatalf("ReadRejection = %+v, %v", got, ok)
 	}
 	// A different token starts from zero.
 	if _, ok := ReadRejection(dir, "def"); ok {
 		t.Fatal("other token blocked")
 	}
-	rec, _ = RecordRejection(dir, "def", t0.Add(20*time.Minute))
+	rec, _ = RecordRejection(dir, "def", t0.Add(120*time.Minute))
 	if rec.Count != 1 {
 		t.Fatalf("new token count = %d", rec.Count)
 	}
