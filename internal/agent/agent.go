@@ -31,7 +31,11 @@ type Options struct {
 	// StateDir is where a newer-release hint is left for `upgrade` (the
 	// spool directory). Empty disables the file; the log line still appears.
 	StateDir string
-	Log      *slog.Logger
+	// TokenFingerprint identifies the token for the rejected-token record.
+	TokenFingerprint string
+	// Now is the clock (tests); nil means time.Now.
+	Now func() time.Time
+	Log *slog.Logger
 }
 
 const (
@@ -49,11 +53,23 @@ type Agent struct {
 	updateNoted  string
 	stateCleared bool
 	accepted     bool // first successful push seen: any rejected-token record is stale
+	// pauseUntil: after a token rejection the agent waits before asking
+	// again (batches are spooled meanwhile); ErrTokenRejected is returned
+	// only once the rejection has held long enough to be final.
+	pauseUntil time.Time
 }
+
+// ErrTokenRejected is returned by Run/Once once the server has rejected
+// the token repeatedly over a span of time: the host was removed in
+// WatchFor or its token was rotated, and the agent should stop.
+var ErrTokenRejected = errors.New("token rejected by the server repeatedly")
 
 func New(o Options) *Agent {
 	if o.Log == nil {
 		o.Log = slog.Default()
+	}
+	if o.Now == nil {
+		o.Now = time.Now
 	}
 	return &Agent{o: o, interval: o.Interval, failing: map[string]string{}}
 }
@@ -115,9 +131,37 @@ func (a *Agent) Once(ctx context.Context, gap time.Duration) error {
 
 func (a *Agent) tick(ctx context.Context) error {
 	err := a.send(ctx, a.Collect(ctx))
-	if errors.Is(err, push.ErrUnauthorized) {
+	if errors.Is(err, ErrTokenRejected) {
 		return err
 	}
+	return nil
+}
+
+// rejected handles a 401/403 from the server. One rejection can be the
+// server having a bad minute (its token cache cold, its database away),
+// so the agent records it, spools the batch and waits with backoff; only
+// a rejection that holds across several attempts and minutes is final.
+func (a *Agent) rejected(err error, body []byte) error {
+	now := a.o.Now()
+	rec, rerr := RecordRejection(a.o.StateDir, a.o.TokenFingerprint, now)
+	if rerr != nil {
+		a.o.Log.Debug("could not record the rejected token", "error", rerr)
+	}
+	if rec.Sticky() {
+		a.o.Log.Error("stopping: the server has rejected this host's token repeatedly",
+			"error", err, "rejections", rec.Count, "since", rec.First.Format(time.RFC3339),
+			"why", "the host was removed in WatchFor or its token was rotated",
+			"fix", "put the new token in place and restart, or stop the agent: sudo systemctl disable --now watchfor-agent")
+		return ErrTokenRejected
+	}
+	wait := rec.Backoff()
+	a.pauseUntil = now.Add(wait)
+	if a.o.Spool != nil {
+		_ = a.o.Spool.Put(body)
+	}
+	a.o.Log.Warn("token rejected by the server; will try again",
+		"error", err, "attempt", rec.Count, "of", StickyRejections, "retry_in", wait.String(),
+		"note", "if the host was removed in WatchFor or its token rotated, the agent stops by itself after "+StickySpan.String())
 	return nil
 }
 
@@ -171,12 +215,18 @@ func (a *Agent) send(ctx context.Context, p *metric.Payload) error {
 	if err != nil {
 		return err
 	}
+	if now := a.o.Now(); now.Before(a.pauseUntil) {
+		// Waiting out a token rejection: keep the batch, do not ask yet.
+		if a.o.Spool != nil {
+			_ = a.o.Spool.Put(body)
+		}
+		return nil
+	}
 	ack, err := a.o.Sink.Send(ctx, body)
 	if err != nil {
 		switch {
 		case errors.Is(err, push.ErrUnauthorized):
-			a.o.Log.Error("token rejected, stopping", "error", err)
-			return err
+			return a.rejected(err, body)
 		case push.Retryable(err) && a.o.Spool != nil:
 			if serr := a.o.Spool.Put(body); serr != nil {
 				a.o.Log.Error("send failed and spool refused the batch", "error", err, "spool", serr)

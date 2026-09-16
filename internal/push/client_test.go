@@ -42,6 +42,9 @@ func TestSendHeadersAndStatuses(t *testing.T) {
 		if r.URL.Path != Path {
 			t.Errorf("path = %s", r.URL.Path)
 		}
+		if status == http.StatusUnauthorized {
+			w.Header().Set(ReasonHeader, "token_unknown") // ingest's own verdict
+		}
 		w.WriteHeader(status)
 		w.Write([]byte("nope"))
 	}))
@@ -92,4 +95,45 @@ func TestBadCAFile(t *testing.T) {
 	if _, err := New("https://x", "t", "/nonexistent", time.Second, "x"); err == nil {
 		t.Error("missing ca_file must fail at construction")
 	}
+}
+
+func TestRejectionNeedsIngestReasonHeader(t *testing.T) {
+	// A 401 from ingest carries the reason header → the token is really gone.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Test-Proxy") == "1" {
+			http.Error(w, "<html>captive portal</html>", http.StatusUnauthorized) // no reason header
+			return
+		}
+		w.Header().Set(ReasonHeader, "token_unknown")
+		http.Error(w, "unknown or revoked token", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	c, err := New(srv.URL, "wfh_x", "", 5*time.Second, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Send(context.Background(), []byte("{}"))
+	if !errors.Is(err, ErrUnauthorized) || Retryable(err) {
+		t.Fatalf("ingest 401 with reason: want ErrUnauthorized (not retryable), got %v", err)
+	}
+	// The same status without the header is something in between answering:
+	// retry, never give the token up.
+	c.userAgent = "test"
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+Path, nil)
+	req.Header.Set("X-Test-Proxy", "1")
+	proxied := &Client{endpoint: srv.URL + Path, token: "wfh_x", userAgent: "test", http: &http.Client{Transport: headerTransport{"X-Test-Proxy": "1"}}}
+	_, err = proxied.Send(context.Background(), []byte("{}"))
+	if errors.Is(err, ErrUnauthorized) || !Retryable(err) {
+		t.Fatalf("401 without the reason header must be retryable, got %v", err)
+	}
+}
+
+// headerTransport adds fixed headers to every request.
+type headerTransport map[string]string
+
+func (h headerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	for k, v := range h {
+		r.Header.Set(k, v)
+	}
+	return http.DefaultTransport.RoundTrip(r)
 }

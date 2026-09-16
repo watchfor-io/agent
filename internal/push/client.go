@@ -27,6 +27,12 @@ const Path = "/v1/agent/metrics"
 
 var ErrUnauthorized = errors.New("token rejected by the server")
 
+// ReasonHeader is set by WatchFor's ingest on every 401/403/503 it produces
+// (token_unknown, plan_forbidden, lookup_unavailable). A 401 without it did
+// not come from ingest — a proxy, CDN or captive portal answered — and is
+// treated as a transient failure, never as a revoked token.
+const ReasonHeader = "X-WatchFor-Reason"
+
 type StatusError struct {
 	Code int
 	Body string
@@ -40,11 +46,14 @@ func (e *StatusError) Error() string {
 }
 
 // Retryable reports whether a Send failure should be spooled and retried:
-// network trouble, 429 and 5xx. A 4xx means the batch itself is the problem.
+// network trouble, 429, 5xx, and a 401/403 that did not come from ingest
+// (no reason header: something in between answered). A 4xx about the
+// batch itself (413, 400) is not retried.
 func Retryable(err error) bool {
 	var se *StatusError
 	if errors.As(err, &se) {
-		return se.Code == http.StatusTooManyRequests || se.Code >= 500
+		return se.Code == http.StatusTooManyRequests || se.Code >= 500 ||
+			se.Code == http.StatusUnauthorized || se.Code == http.StatusForbidden
 	}
 	return !errors.Is(err, ErrUnauthorized) && err != nil
 }
@@ -150,6 +159,13 @@ func (c *Client) Send(ctx context.Context, body []byte) (Ack, error) {
 		_ = json.Unmarshal(msg, &ack)
 		return ack, nil
 	case res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden:
+		// Only ingest's own verdict counts as a rejected token; a 401 from a
+		// proxy or CDN in the way is a transient failure like any other.
+		switch res.Header.Get(ReasonHeader) {
+		case "token_unknown", "token_revoked", "plan_forbidden":
+		default:
+			return Ack{}, &StatusError{Code: res.StatusCode, Body: strings.TrimSpace(string(msg))}
+		}
 		// Keep the server's reason: "unknown or revoked token" and "hosts are
 		// not included in this plan" call for different fixes.
 		if reason := strings.TrimSpace(string(msg)); reason != "" {

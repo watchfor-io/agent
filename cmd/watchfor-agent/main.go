@@ -141,12 +141,14 @@ func run(args []string) int {
 	}
 	opts.Sink = client
 
-	// A token the server already rejected (host removed in WatchFor, or
-	// token rotated) is not tried again: say why and stop, until a
-	// different token is configured.
-	if at, ok := agent.RejectedAt(cfg.Spool.Dir, client.TokenFingerprint()); ok {
+	// A token the server kept rejecting (host removed in WatchFor, or token
+	// rotated) is not tried again: say why and stop, until a different
+	// token is configured. A rejection that has not held long enough yet
+	// is retried normally.
+	opts.TokenFingerprint = client.TokenFingerprint()
+	if rec, ok := agent.ReadRejection(cfg.Spool.Dir, opts.TokenFingerprint); ok && rec.Sticky() {
 		log.Error("token rejected by the server; not retrying",
-			"rejected_at", at.Format(time.RFC3339),
+			"rejections", rec.Count, "since", rec.First.Format(time.RFC3339), "last", rec.Last.Format(time.RFC3339),
 			"why", "the host was removed in WatchFor or its token was rotated",
 			"fix", "put the new token in "+cfg.Server.TokenFile+" and restart, or stop the agent: sudo systemctl disable --now watchfor-agent")
 		return exitAuth
@@ -174,13 +176,7 @@ func run(args []string) int {
 		err = a.Run(ctx)
 	}
 	switch {
-	case errors.Is(err, push.ErrUnauthorized):
-		if merr := agent.MarkRejected(cfg.Spool.Dir, client.TokenFingerprint(), time.Now()); merr != nil {
-			log.Debug("could not record the rejected token", "error", merr)
-		}
-		log.Error("stopping: the server rejected this host's token",
-			"why", "the host was removed in WatchFor or its token was rotated",
-			"fix", "put the new token in "+cfg.Server.TokenFile+" and restart, or stop the agent: sudo systemctl disable --now watchfor-agent")
+	case errors.Is(err, agent.ErrTokenRejected):
 		return exitAuth
 	case err != nil && !errors.Is(err, context.Canceled):
 		log.Error("stopped", "error", err)

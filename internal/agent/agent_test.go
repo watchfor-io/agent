@@ -31,9 +31,11 @@ type fakeSink struct {
 	fail     error
 	interval int // what the server asks for, seconds
 	got      []*metric.Payload
+	calls    int
 }
 
 func (s *fakeSink) Send(_ context.Context, body []byte) (push.Ack, error) {
+	s.calls++
 	if s.fail != nil {
 		return push.Ack{}, s.fail
 	}
@@ -101,13 +103,62 @@ func TestSpoolAndReplay(t *testing.T) {
 	}
 }
 
-func TestUnauthorizedStops(t *testing.T) {
+// A rejected token stops the agent only once the rejection has held
+// across several attempts and minutes; a single 401 (the server's token
+// cache cold, its database away) is retried after a pause, with the
+// batches spooled meanwhile.
+func TestUnauthorizedStopsOnlyWhenItSticks(t *testing.T) {
+	sp, _ := spool.Open(t.TempDir(), 1<<20)
 	sink := &fakeSink{fail: push.ErrUnauthorized}
-	a := newAgent(t, sink, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := a.Run(ctx); !errors.Is(err, push.ErrUnauthorized) {
-		t.Errorf("Run should return the auth error, got %v", err)
+	a := newAgent(t, sink, sp)
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	a.o.Now = func() time.Time { return now }
+	a.o.StateDir = t.TempDir()
+	a.o.TokenFingerprint = "fp1"
+	ctx := context.Background()
+
+	if err := a.tick(ctx); err != nil {
+		t.Fatalf("first rejection must not stop the agent: %v", err)
+	}
+	if n, _ := sp.Stats(); n != 1 {
+		t.Fatalf("rejected batch should be spooled, spool has %d", n)
+	}
+	// Still paused: no request goes out, the batch is spooled.
+	calls := sink.calls
+	now = now.Add(30 * time.Second)
+	if err := a.tick(ctx); err != nil || sink.calls != calls {
+		t.Fatalf("paused agent asked the server (calls %d→%d, err %v)", calls, sink.calls, err)
+	}
+	now = now.Add(2 * time.Minute) // rejection 2 at +2m30s
+	if err := a.tick(ctx); err != nil {
+		t.Fatalf("second rejection must not stop the agent: %v", err)
+	}
+	now = now.Add(6 * time.Minute) // rejection 3 at +8m30s: three rejections, but under ten minutes
+	if err := a.tick(ctx); err != nil {
+		t.Fatalf("three rejections within ten minutes must not stop the agent: %v", err)
+	}
+	now = now.Add(11 * time.Minute) // rejection 4 at +19m30s: sticky
+	if err := a.tick(ctx); !errors.Is(err, ErrTokenRejected) {
+		t.Fatalf("a rejection held for 19 minutes should stop the agent, got %v", err)
+	}
+	if rec, ok := ReadRejection(a.o.StateDir, "fp1"); !ok || !rec.Sticky() {
+		t.Fatalf("record not sticky on disk: %+v %v", rec, ok)
+	}
+}
+
+// A token that works again clears the record.
+func TestAcceptedPushClearsRejection(t *testing.T) {
+	a := newAgent(t, &fakeSink{}, nil)
+	a.o.StateDir = t.TempDir()
+	a.o.TokenFingerprint = "fp1"
+	if _, err := RecordRejection(a.o.StateDir, "fp1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ReadRejection(a.o.StateDir, "fp1"); ok {
+		t.Fatal("record survived an accepted push")
 	}
 }
 
