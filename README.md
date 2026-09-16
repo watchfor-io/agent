@@ -30,6 +30,21 @@ It needs root, systemd, `curl`, `tar`, `sha256sum`, `useradd` and
 not end the script halfway through: on a terminal, run with sudo, it
 shows the one install command for your distribution and offers to run it
 (`--yes` skips the question); otherwise it prints that command and stops.
+Package installs run unattended (no debconf, needrestart or conffile
+prompts, bounded lock waits) with the package manager's last line shown
+next to the spinner, and Ctrl-C stops everything at once, leaving the
+step's output in `/tmp/watchfor-install.log`.
+
+On a terminal the script also asks whether to enable daily auto-update
+(see [Upgrade](#upgrade)); `--auto-update` / `--no-auto-update` decide
+without asking. Re-running it on a host that already has this version
+offers a reinstall and lets you switch auto-update on or off — it is the
+one tool for installing, upgrading and reconfiguring the agent
+(`--reinstall` forces a fresh download non-interactively).
+
+Prefer to keep the token out of `ps` and your shell history: pass
+`--token -` and the script asks for it on the terminal without echoing
+it; `WATCHFOR_TOKEN=…` in the environment works for automation.
 Progress, colours and the summary box appear only on a terminal; `--plain`
 (or `NO_COLOR=1`) keeps the output to plain lines for logs and CI. The release signature is verified by default. Once an
 agent 0.3.0 or newer is installed, upgrades no longer need minisign: the
@@ -163,6 +178,31 @@ of jitter) runs `watchfor-agent upgrade -if-available`, which acts only on
 the version the server reported and never polls GitHub on its own. The
 daemon itself stays unprivileged: the swap is done by the root-run
 one-shot unit, not by the running agent.
+
+The agent manages that timer itself, so you can switch it at any time
+without the installer:
+
+```sh
+sudo watchfor-agent auto-update on       # installs + enables the timer, writes updates.auto: true
+sudo watchfor-agent auto-update off      # removes the timer, writes updates.auto: false
+watchfor-agent auto-update status
+```
+
+The setting lives in `agent.yml` as `updates.auto`; when it is `false`
+the timer's run does nothing even if the timer is still there. Other
+settings can be changed the same way, validated before they are written:
+
+```sh
+sudo watchfor-agent config set interval 30s
+sudo watchfor-agent config set host.tags.env prod
+watchfor-agent config get interval
+watchfor-agent config keys
+```
+
+`config set` keeps your comments and the rest of the file untouched, and
+refuses a value the agent would not start with (an interval below 5 s, an
+invalid host name). Restart the service afterwards for anything but
+`updates.auto`.
 
 ## Configuration
 

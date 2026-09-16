@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -89,6 +91,14 @@ func New(baseURL, token, caFile string, timeout time.Duration, version string) (
 		userAgent: "watchfor-agent/" + version,
 		http:      &http.Client{Transport: transport, Timeout: timeout},
 	}, nil
+}
+
+// TokenFingerprint identifies the token without revealing it (first 12
+// hex digits of its SHA-256): the rejected-token marker is keyed on it, so
+// a new token clears the block by itself.
+func (c *Client) TokenFingerprint() string {
+	sum := sha256.Sum256([]byte(c.token))
+	return hex.EncodeToString(sum[:6])
 }
 
 func Encode(p *metric.Payload) ([]byte, error) {

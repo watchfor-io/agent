@@ -48,6 +48,7 @@ type Agent struct {
 	// appears once per release, not once per push.
 	updateNoted  string
 	stateCleared bool
+	accepted     bool // first successful push seen: any rejected-token record is stale
 }
 
 func New(o Options) *Agent {
@@ -189,6 +190,10 @@ func (a *Agent) send(ctx context.Context, p *metric.Payload) error {
 	}
 	a.applyAck(ack)
 	a.noteUpdate(ack.LatestVersion)
+	if !a.accepted {
+		a.accepted = true
+		ClearRejected(a.o.StateDir)
+	}
 	a.replay(ctx)
 	return nil
 }

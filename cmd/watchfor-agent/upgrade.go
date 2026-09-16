@@ -32,9 +32,19 @@ func runUpgrade(args []string) int {
 		return exitUsage
 	}
 
+	// Read settings without requiring the token (config.Get validates the
+	// file the way the agent does, minus the token source).
 	stateDir := config.DefaultSpoolDir
-	if cfg, err := config.Load(*configPath); err == nil && cfg.Spool.Dir != "" {
-		stateDir = cfg.Spool.Dir
+	if v, err := config.Get(*configPath, "spool.dir"); err == nil && v != "" {
+		stateDir = v
+	}
+	// The timer runs -if-available; an operator who switched auto-update
+	// off in agent.yml (but left the timer) still gets no surprise.
+	if *ifAvailable {
+		if v, err := config.Get(*configPath, "updates.auto"); err == nil && v == "false" {
+			fmt.Printf("auto-update is off in %s; nothing to do (sudo watchfor-agent auto-update on to enable)\n", *configPath)
+			return exitOK
+		}
 	}
 	opts := update.Options{
 		Current:        Version,

@@ -48,7 +48,13 @@ func ID() string {
 	return hex.EncodeToString(sum[:8])
 }
 
-func Facts() metric.Facts {
+// Facts collects the slow-changing facts. FactsFor also works out the
+// primary address by asking the kernel which source address it would use
+// to reach target (the server's host name); Facts uses a public resolver
+// address for the same question.
+func Facts() metric.Facts { return FactsFor("") }
+
+func FactsFor(target string) metric.Facts {
 	f := metric.Facts{CPUModel: cpuModel(), Virtualization: virtualization()}
 	if st, err := procfs.ReadStat(); err == nil {
 		f.CPUCores = len(st.PerCPU)
@@ -57,7 +63,8 @@ func Facts() metric.Facts {
 	if m, err := procfs.ReadMeminfo(); err == nil {
 		f.MemTotal = m["MemTotal"]
 	}
-	f.Addresses = addresses()
+	f.PrimaryAddress, f.PrimaryAddress6, f.PrimaryIface = primaryAddress(target)
+	f.Addresses = addresses(f.PrimaryIface)
 	return f
 }
 

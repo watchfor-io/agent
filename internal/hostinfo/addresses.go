@@ -3,6 +3,7 @@ package hostinfo
 import (
 	"net"
 	"sort"
+	"strings"
 )
 
 // Caps keep a host with hundreds of veth/bridge addresses from turning the
@@ -18,9 +19,25 @@ type ifaceAddrs struct {
 	addrs []net.IP
 }
 
+// virtualIface reports interface names that belong to container and VM
+// plumbing (bridges, veth pairs, CNI, libvirt) rather than to the host's
+// own connectivity. A node running a hundred containers has a hundred of
+// these; none of them is "the host's address". The interface carrying the
+// primary address is always kept, whatever its name (a WireGuard-only
+// host reaches the server through wg0).
+func virtualIface(name string) bool {
+	for _, p := range []string{"docker", "br-", "veth", "cni", "flannel", "cali", "tunl", "vxlan", "virbr", "vnet", "lxc", "lxd", "kube", "dummy", "ovs", "tap"} {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // addresses lists the routable addresses per interface: what an operator
-// would grep for when a host shows up as "10.0.4.7" somewhere else.
-func addresses() map[string][]string {
+// would grep for when a host shows up as "10.0.4.7" somewhere else. keep
+// names an interface that is never filtered out.
+func addresses(keep string) map[string][]string {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil
@@ -39,19 +56,28 @@ func addresses() map[string][]string {
 		}
 		in = append(in, e)
 	}
-	return filterAddresses(in)
+	return filterAddresses(in, keep)
 }
 
 // filterAddresses drops loopback and down interfaces, loopback and
 // link-local addresses, and orders the rest so the output is stable.
-func filterAddresses(in []ifaceAddrs) map[string][]string {
+func filterAddresses(in []ifaceAddrs, keep string) map[string][]string {
 	out := map[string][]string{}
-	sort.Slice(in, func(i, j int) bool { return in[i].name < in[j].name })
+	// The kept (primary) interface first, so the caps never drop it.
+	sort.SliceStable(in, func(i, j int) bool {
+		if (in[i].name == keep) != (in[j].name == keep) {
+			return in[i].name == keep
+		}
+		return in[i].name < in[j].name
+	})
 	for _, i := range in {
 		if len(out) == maxAddrInterfaces {
 			break
 		}
 		if i.flags&net.FlagLoopback != 0 || i.flags&net.FlagUp == 0 {
+			continue
+		}
+		if i.name != keep && virtualIface(i.name) {
 			continue
 		}
 		var keep []string

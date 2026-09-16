@@ -5,6 +5,8 @@
 //	watchfor-agent once     one collection, one push, exit (cron)
 //	watchfor-agent check    print what would be sent, no network
 //	watchfor-agent upgrade  install a newer signed release, restart the service
+//	watchfor-agent auto-update on|off|status
+//	watchfor-agent config get|set|keys|path
 //	watchfor-agent version
 package main
 
@@ -25,6 +27,7 @@ import (
 	"github.com/watchfor-io/agent/internal/agent"
 	"github.com/watchfor-io/agent/internal/config"
 	"github.com/watchfor-io/agent/internal/hostinfo"
+	"github.com/watchfor-io/agent/internal/metric"
 	"github.com/watchfor-io/agent/internal/modules"
 	"github.com/watchfor-io/agent/internal/push"
 	"github.com/watchfor-io/agent/internal/spool"
@@ -64,6 +67,10 @@ func run(args []string) int {
 		return exitOK
 	case "upgrade":
 		return runUpgrade(args)
+	case "auto-update":
+		return runAutoUpdate(args)
+	case "config":
+		return runConfig(args)
 	case "run", "once", "check":
 	default:
 		usage()
@@ -100,7 +107,7 @@ func run(args []string) int {
 	opts := agent.Options{
 		Modules:  mods,
 		Host:     hostinfo.Host(cfg.Host.Name, cfg.Host.Tags),
-		Facts:    hostinfo.Facts,
+		Facts:    func() metric.Facts { return hostinfo.FactsFor(cfg.Server.URL) },
 		Version:  Version,
 		Interval: cfg.Interval,
 		StateDir: cfg.Spool.Dir,
@@ -134,6 +141,17 @@ func run(args []string) int {
 	}
 	opts.Sink = client
 
+	// A token the server already rejected (host removed in WatchFor, or
+	// token rotated) is not tried again: say why and stop, until a
+	// different token is configured.
+	if at, ok := agent.RejectedAt(cfg.Spool.Dir, client.TokenFingerprint()); ok {
+		log.Error("token rejected by the server; not retrying",
+			"rejected_at", at.Format(time.RFC3339),
+			"why", "the host was removed in WatchFor or its token was rotated",
+			"fix", "put the new token in "+cfg.Server.TokenFile+" and restart, or stop the agent: sudo systemctl disable --now watchfor-agent")
+		return exitAuth
+	}
+
 	if cfg.Spool.MaxMB > 0 {
 		sp, err := spool.Open(cfg.Spool.Dir, int64(cfg.Spool.MaxMB)<<20)
 		if err != nil {
@@ -157,6 +175,12 @@ func run(args []string) int {
 	}
 	switch {
 	case errors.Is(err, push.ErrUnauthorized):
+		if merr := agent.MarkRejected(cfg.Spool.Dir, client.TokenFingerprint(), time.Now()); merr != nil {
+			log.Debug("could not record the rejected token", "error", merr)
+		}
+		log.Error("stopping: the server rejected this host's token",
+			"why", "the host was removed in WatchFor or its token was rotated",
+			"fix", "put the new token in "+cfg.Server.TokenFile+" and restart, or stop the agent: sudo systemctl disable --now watchfor-agent")
 		return exitAuth
 	case err != nil && !errors.Is(err, context.Canceled):
 		log.Error("stopped", "error", err)
@@ -223,7 +247,9 @@ func usage() {
   run      collect on the configured interval and push (the systemd service)
   once     collect once, push once, exit — for cron
   check    collect once and print the batch that would be sent; no network
-  upgrade  install a newer signed release (root); -check only reports
+  upgrade      install a newer signed release (root); -check only reports
+  auto-update  on|off|status — daily signed updates via a systemd timer (root)
+  config       get|set|keys|path — read or change one setting in agent.yml
   version
 `, defaultConfig)
 }

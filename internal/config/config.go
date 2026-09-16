@@ -23,6 +23,7 @@ type Config struct {
 	Interval time.Duration        `yaml:"interval"`
 	Spool    Spool                `yaml:"spool"`
 	Log      Log                  `yaml:"log"`
+	Updates  Updates              `yaml:"updates"`
 	Modules  map[string]yaml.Node `yaml:"modules"`
 }
 
@@ -46,6 +47,15 @@ type Spool struct {
 
 type Log struct {
 	Level string `yaml:"level"`
+}
+
+// Updates is the agent's own record of the auto-update setting.
+// `watchfor-agent auto-update on|off` writes it together with enabling or
+// disabling the systemd timer, and `upgrade -if-available` (what the
+// timer runs) does nothing while it is explicitly false. Unset means "no
+// opinion" — the timer alone decides.
+type Updates struct {
+	Auto *bool `yaml:"auto"`
 }
 
 const (
@@ -77,7 +87,12 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-func Parse(r io.Reader) (*Config, error) {
+func Parse(r io.Reader) (*Config, error) { return parseConfig(r, true) }
+
+// parseConfig decodes and validates; withToken also reads the token source
+// (file / env), which the CLI's config editor skips — a host whose token
+// is not written yet must still be able to change its settings.
+func parseConfig(r io.Reader, withToken bool) (*Config, error) {
 	var cfg Config
 	dec := yaml.NewDecoder(r)
 	dec.KnownFields(true)
@@ -87,8 +102,10 @@ func Parse(r io.Reader) (*Config, error) {
 	if err := cfg.applyDefaults(); err != nil {
 		return nil, err
 	}
-	if err := cfg.resolveToken(); err != nil {
-		return nil, err
+	if withToken {
+		if err := cfg.resolveToken(); err != nil {
+			return nil, err
+		}
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
