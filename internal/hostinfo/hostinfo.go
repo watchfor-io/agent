@@ -55,7 +55,7 @@ func ID() string {
 func Facts() metric.Facts { return FactsFor("") }
 
 func FactsFor(target string) metric.Facts {
-	f := metric.Facts{CPUModel: cpuModel(), Virtualization: virtualization()}
+	f := metric.Facts{CPUModel: cpuModel(), Hardware: hardware(), Virtualization: virtualization()}
 	if st, err := procfs.ReadStat(); err == nil {
 		f.CPUCores = len(st.PerCPU)
 		f.BootTime = st.BootTime
@@ -91,24 +91,6 @@ func kernel() string {
 	return strings.TrimSpace(string(b))
 }
 
-func cpuModel() string {
-	b, err := os.ReadFile(filepath.Join(procfs.Root, "cpuinfo"))
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		k, v, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
-		}
-		switch strings.TrimSpace(k) {
-		case "model name", "Model", "cpu model":
-			return strings.TrimSpace(v)
-		}
-	}
-	return ""
-}
-
 // virtualization is best effort: DMI vendor strings for VMs, well-known
 // marker files for containers, the cpuinfo hypervisor flag as a fallback.
 func virtualization() string {
@@ -126,11 +108,14 @@ func virtualization() string {
 			return "kubernetes"
 		}
 	}
-	vendor := readSys("class/dmi/id/sys_vendor") + " " + readSys("class/dmi/id/product_name")
+	d := readDMI()
+	if c := detectCloud(d); c != nil {
+		return c.virt
+	}
+	vendor := d.vendor + " " + d.product
 	for marker, name := range map[string]string{
 		"QEMU": "kvm", "KVM": "kvm", "VMware": "vmware", "VirtualBox": "virtualbox",
-		"Xen": "xen", "Microsoft Corporation": "hyperv", "Amazon EC2": "ec2",
-		"Google": "gce", "DigitalOcean": "digitalocean", "Hetzner": "hetzner", "OpenStack": "openstack",
+		"Xen": "xen", "Microsoft Corporation": "hyperv", "Parallels": "parallels", "innotek": "virtualbox",
 	} {
 		if strings.Contains(vendor, marker) {
 			return name

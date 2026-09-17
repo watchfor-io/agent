@@ -31,7 +31,10 @@ type Facts struct {
 	CPUCores       int    `json:"cpu_cores"`
 	MemTotal       uint64 `json:"mem_total"`
 	Virtualization string `json:"virtualization,omitempty"`
-	BootTime       int64  `json:"boot_time"`
+	// The machine as the firmware describes it: cloud instance type on EC2
+	// ("Amazon EC2 t4g.small"), server model on metal ("Dell Inc. PowerEdge R640").
+	Hardware string `json:"hardware,omitempty"`
+	BootTime int64  `json:"boot_time"`
 	// Routable addresses per interface; loopback and link-local left out.
 	Addresses map[string][]string `json:"addresses,omitempty"`
 	// The address the host uses to reach the server (its default route's

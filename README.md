@@ -271,9 +271,23 @@ Rules that hold for the whole file:
 Rates need two samples, so the first tick after start reports gauges only;
 `once` takes two samples one second apart for the same reason.
 
-Host facts (OS, kernel, CPU model and count, memory, virtualization, boot
+Host facts (OS, kernel, CPU model and count, hardware, memory, virtualization, boot
 time, routable addresses per interface) travel with the first batch and
 then once an hour.
+
+`hardware` is the machine as the firmware describes it — the server model
+on metal (`Dell Inc. PowerEdge R640`), the instance type on a cloud. The
+provider comes from the DMI tables; where those do not carry the size, the
+agent asks that provider's metadata service once an hour, link-local and
+with a sub-second timeout, and nothing else: AWS (IMDSv2), Google Compute
+Engine, Azure, Oracle Cloud, Alibaba Cloud, Tencent Cloud and Scaleway.
+`virtualization` names the provider when known (`ec2`, `gce`, `azure`,
+`oci`, `alibaba`, `tencent`, `scaleway`, `digitalocean`, `hetzner`,
+`vultr`, `linode`, `openstack`), else the hypervisor (`kvm`, `vmware`,
+`hyperv`, `xen`, `virtualbox`) or the container runtime (`docker`, `lxc`,
+`kubernetes`). ARM CPUs, which report no model name, are named from the
+implementer and part numbers (`ARM Neoverse-N1`, or `AWS Graviton2
+(Neoverse-N1)` on EC2).
 
 ## The systemd unit
 
@@ -309,7 +323,7 @@ uses the same directory, so a cron-driven host catches up on its next run.
   "host": { "id": "3f9a…", "name": "web-01", "tags": {"env": "prod"},
             "os": "Ubuntu 24.04.1 LTS", "kernel": "6.8.0-45-generic", "arch": "amd64" },
   "facts": { "cpu_model": "AMD EPYC 7B13", "cpu_cores": 4, "mem_total": 8329273344,
-             "virtualization": "kvm", "boot_time": 1757600000,
+             "hardware": "Amazon EC2 t3.medium", "virtualization": "ec2", "boot_time": 1757600000,
              "addresses": { "eth0": ["10.0.4.7", "2001:db8::7"] } },
   "samples": [
     { "t": 1757836800, "m": "cpu.usage_pct", "v": 12.4 },
