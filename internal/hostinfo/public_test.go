@@ -56,7 +56,11 @@ func TestCloudPublicAddressesFromMetadata(t *testing.T) {
 		case r.URL.Path == "/latest/meta-data/eipv4":
 			io.WriteString(w, "47.1.2.3")
 		case r.URL.Path == "/latest/meta-data/network/interfaces/macs/":
-			io.WriteString(w, "0a:bb:cc:dd:ee:ff/\n")
+			// a hostile listing: only the real MAC may become a path
+			io.WriteString(w, "0a:bb:cc:dd:ee:ff/\n../../api/token/\nevil.example/\n")
+		case strings.HasPrefix(r.URL.Path, "/latest/api/token") || strings.Contains(r.URL.Path, "evil.example"):
+			t.Errorf("a listing line became a request path: %s", r.URL.Path)
+			w.WriteHeader(404)
 		case r.URL.Path == "/latest/meta-data/network/interfaces/macs/0a:bb:cc:dd:ee:ff/ipv6s":
 			io.WriteString(w, "2600:1f18::1\n2600:1f18::2\nfe80::1\n")
 		case r.URL.Path == "/computeMetadata/v1/instance/network-interfaces/":
@@ -143,5 +147,4 @@ func TestCloudPublicAddressesFromMetadata(t *testing.T) {
 	if _, public := cloudInfo(Options{CloudMetadata: false}); public != nil {
 		t.Errorf("lookup off but got %v", public)
 	}
-	_ = strings.TrimSpace
 }
