@@ -16,10 +16,10 @@ jobs:
       id-token: write # the provenance attestation
       attestations: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       # Pure-Go minisign, pinned. The secret key is written to a 0600 file for
@@ -33,7 +33,7 @@ jobs:
           echo "MINISIGN_SECRET_KEY_FILE=$RUNNER_TEMP/minisign.key" >> "$GITHUB_ENV"
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: "~> v2"
           args: release --clean
@@ -44,7 +44,7 @@ jobs:
         run: rm -f "$RUNNER_TEMP/minisign.key"
       # Build provenance for every published asset, verifiable with
       # `gh attestation verify <file> --repo watchfor-io/agent`.
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*.tar.gz
@@ -59,10 +59,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: Rebuild and compare
@@ -71,14 +71,24 @@ jobs:
         run: |
           set -eu
           tag="${GITHUB_REF_NAME}"; ver="${tag#v}"
+          # Go stamps vcs.modified into the binary from `git status`, so a
+          # single stray file in the tree changes the bytes. Everything this
+          # job writes goes outside the checkout, and both binaries are built
+          # before anything is downloaded.
+          out="$RUNNER_TEMP/reproduce"; mkdir -p "$out"
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "the checkout is not clean; a rebuild from it cannot match:"; git status --porcelain; exit 1
+          fi
           for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "-s -w -X main.Version=$ver" -o "rebuilt-$arch" ./cmd/watchfor-agent
-            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "watchfor-agent_${ver}_linux_${arch}.tar.gz" --output "release-$arch.tar.gz" --clobber
-            tar -xzf "release-$arch.tar.gz" watchfor-agent
-            if cmp -s watchfor-agent "rebuilt-$arch"; then
-              echo "linux/$arch: the published binary reproduces ($(sha256sum < watchfor-agent | cut -c1-16)…)"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "-s -w -X main.Version=$ver" -o "$out/rebuilt-$arch" ./cmd/watchfor-agent
+          done
+          for arch in amd64 arm64; do
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "watchfor-agent_${ver}_linux_${arch}.tar.gz" --output "$out/release-$arch.tar.gz" --clobber
+            tar -xzf "$out/release-$arch.tar.gz" -C "$out" watchfor-agent
+            if cmp -s "$out/watchfor-agent" "$out/rebuilt-$arch"; then
+              echo "linux/$arch: the published binary reproduces ($(sha256sum < "$out/watchfor-agent" | cut -c1-16)…)"
             else
               echo "linux/$arch: the published binary does NOT reproduce"; exit 1
             fi
-            rm -f watchfor-agent
+            rm -f "$out/watchfor-agent"
           done

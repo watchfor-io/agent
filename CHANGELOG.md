@@ -3,6 +3,14 @@
 Releases are tagged `vX.Y.Z`; every tarball ships with a `checksums.txt`
 signed by the WatchFor release key. Dates are the day the tag was pushed.
 
+## 0.7.1 — 2026-09-21
+
+- The release's reproducibility check tripped over its own downloads: it
+  saved the published tarball into the source tree before rebuilding the
+  second binary, and Go stamps a dirty tree into the build. The 0.7.0
+  binaries do reproduce; the check now builds first and writes nothing
+  into the tree. No change to the agent itself.
+
 ## 0.7.0 — 2026-09-21
 
 - **One screen for the whole agent.** `watchfor-agent` with no command opens
