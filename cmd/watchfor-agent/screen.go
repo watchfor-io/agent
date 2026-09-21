@@ -41,7 +41,7 @@ var menuItems = []menuItem{
 	{"disks", "Disks", "", "mounts to watch", true},
 	{"network", "Network", "", "interfaces to watch", true},
 	{"processes", "Processes", "", "busiest and watched", true},
-	{"cloud", "Cloud lookup", "", "instance size from the cloud", false},
+	{"cloud", "Cloud lookup", "", "size and public address", false},
 	{"auto", "Auto-update", "", "daily signed releases", false},
 	{"log", "Log level", "", "how much it logs", false},
 	{"file", "The file", "", "agent.yml as written", false},

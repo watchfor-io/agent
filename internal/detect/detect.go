@@ -35,10 +35,12 @@ type Summary struct {
 	Virtualization string
 	PrimaryAddress string
 	PrimaryIface   string
-	Mounts         []disk.Discovered
-	Devices        []string
-	Disks          []disk.Disk
-	Interfaces     []string
+	// PublicAddresses: what the cloud assigned from the outside, if known.
+	PublicAddresses []string
+	Mounts          []disk.Discovered
+	Devices         []string
+	Disks           []disk.Disk
+	Interfaces      []string
 	// Running processes grouped by name, biggest first — what the
 	// configure screen offers when choosing what to watch.
 	Processes []processes.Running
@@ -199,6 +201,7 @@ func Collect(o hostinfo.Options) Summary {
 	s.CPUModel, s.Cores, s.MemTotal = f.CPUModel, f.CPUCores, f.MemTotal
 	s.Hardware, s.Virtualization = f.Hardware, f.Virtualization
 	s.PrimaryAddress, s.PrimaryIface = f.PrimaryAddress, f.PrimaryIface
+	s.PublicAddresses = f.PublicAddresses
 	s.Addresses = f.Addresses
 	var err error
 	if s.Mounts, s.Devices, err = disk.Discover(); err != nil {
@@ -263,6 +266,9 @@ func (s Summary) Print(w io.Writer) {
 		addr += " on " + s.PrimaryIface
 	}
 	row("address", addr)
+	if len(s.PublicAddresses) > 0 {
+		row("public", strings.Join(s.PublicAddresses, " · "))
+	}
 	for i, m := range s.Mounts {
 		k := ""
 		if i == 0 {

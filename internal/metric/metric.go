@@ -46,6 +46,11 @@ type Facts struct {
 	BootTime int64  `json:"boot_time"`
 	// Routable addresses per interface; loopback and link-local left out.
 	Addresses map[string][]string `json:"addresses,omitempty"`
+	// PublicAddresses are the addresses the cloud assigned to this host
+	// from the outside — the elastic/floating IPv4 that NAT keeps off the
+	// interface, and the routed IPv6 — as the provider's metadata service
+	// reports them. Empty on bare metal and when the lookup is off.
+	PublicAddresses []string `json:"public_addresses,omitempty"`
 	// The address the host uses to reach the server (its default route's
 	// source address) — the one to call "the host's IP". IPv4 and IPv6
 	// separately when both exist; the interface that carries them.
