@@ -1,0 +1,78 @@
+version: 2
+project_name: watchfor-agent
+builds:
+  - main: ./cmd/watchfor-agent
+    binary: watchfor-agent
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.Version={{.Version}}"]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md, packaging/agent.example.yml, packaging/watchfor-agent.service, packaging/watchfor-agent.cron]
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+  # install.sh ships as a release asset and is covered by the signed
+  # checksums: watchfor.io serves the copy it verified against them.
+  extra_files:
+    - glob: ./packaging/install.sh
+# The checksums file is signed with minisign; the public key is in
+# packaging/install.sh and in the README. The secret key lives only in the
+# release workflow's secret (and Vault).
+signs:
+  - id: minisign
+    cmd: minisign
+    artifacts: checksum
+    signature: "${artifact}.minisig"
+    args:
+      - "-S"
+      - "-W"
+      - "-s"
+      - "{{ .Env.MINISIGN_SECRET_KEY_FILE }}"
+      - "-t"
+      - "watchfor-agent {{ .Version }} checksums"
+      - "-x"
+      - "${signature}"
+      - "-m"
+      - "${artifact}"
+changelog:
+  use: github
+  filters:
+    exclude: ["^docs:", "^test:", "^ci:"]
+release:
+  draft: false
+  name_template: "watchfor-agent {{ .Version }}"
+  extra_files:
+    - glob: ./packaging/install.sh
+  header: |
+    ## Install
+
+    ```sh
+    curl --proto '=https' --tlsv1.2 -fsSL https://watchfor.io/agent/install.sh | sudo sh -s -- --token <host-token>
+    ```
+
+    No packages needed: the installer checks the tarball's sha256 against the
+    checksums watchfor.io serves (signature-verified there), and the agent
+    verifies the release signature with its built-in key
+    (`watchfor-agent verify`).
+
+    Or download the tarball for your architecture below, verify it, and run the
+    binary by hand — the [README](https://github.com/watchfor-io/agent#install)
+    covers the systemd unit, the cron variant and building from source.
+
+    ## Verify
+
+    ```sh
+    tar -xzf watchfor-agent_*_linux_$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/').tar.gz watchfor-agent
+    ./watchfor-agent verify -checksums checksums.txt watchfor-agent_*.tar.gz
+    ```
+
+    The signature is Ed25519 in minisign format
+    (`minisign -Vm checksums.txt -P RWTUApo01PH7RyjD76wN2Vu7l5sO7Ys5psNQE9I7QYdWVfWSf0CetQje`).
+  footer: |
+    Linux amd64 and arm64, static binaries, `CGO_ENABLED=0`, built from the tag
+    by GoReleaser. Questions and bugs: https://github.com/watchfor-io/agent/issues

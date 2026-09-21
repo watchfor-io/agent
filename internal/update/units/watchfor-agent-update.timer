@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily WatchFor agent update (opt-in: install.sh --auto-update)
+
+[Timer]
+# Once a day, spread over six hours so a fleet does not update in lockstep;
+# a host that was off at the time catches up at boot.
+OnCalendar=daily
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,59 @@
+[Unit]
+Description=WatchFor host agent
+Documentation=https://github.com/watchfor-io/agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=watchfor-agent
+Group=watchfor-agent
+ExecStart=/usr/local/bin/watchfor-agent run -config /etc/watchfor-agent/agent.yml
+Restart=always
+RestartSec=5s
+# Exit 3 = the server rejected the token; restarting would only repeat it.
+RestartPreventExitStatus=3
+# Exit 75 = agent.yml changed and validated; the agent asks to be started
+# again on the new file (no 5 s wait for that one).
+RestartForceExitStatus=75
+Environment=GOMAXPROCS=2
+
+# Outbound HTTPS only; reads /proc and /sys; writes only the spool, which
+# systemd creates and hands to the service account.
+StateDirectory=watchfor-agent
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/watchfor-agent
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+NoNewPrivileges=yes
+# AF_NETLINK: the interface list for the host facts comes over rtnetlink.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectClock=yes
+ProtectHostname=yes
+RemoveIPC=yes
+UMask=0077
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+MemoryMax=256M
+TasksMax=64
+
+# Root-only data (per-process I/O, some /sys files, container sockets):
+# uncomment to grant read access everywhere without running as root.
+#AmbientCapabilities=CAP_DAC_READ_SEARCH
+#CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target

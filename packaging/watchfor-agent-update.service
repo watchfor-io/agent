@@ -1,0 +1,34 @@
+[Unit]
+Description=WatchFor host agent — install a newer signed release when the server reports one
+Documentation=https://github.com/watchfor-io/agent#upgrade
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Only acts on the hint the running agent left in /var/lib/watchfor-agent
+# (the server's "latest release"); never asks GitHub on its own. Verifies
+# the minisign signature and sha256 before touching the binary, then
+# restarts watchfor-agent.service. Root: it replaces /usr/local/bin/watchfor-agent.
+ExecStart=/usr/local/bin/watchfor-agent upgrade -if-available
+ProtectSystem=strict
+ReadWritePaths=/usr/local/bin /var/lib/watchfor-agent /run
+NoNewPrivileges=yes
+PrivateTmp=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelLogs=yes
+SystemCallFilter=@system-service
+# A stuck download must not wedge the timer for good.
+TimeoutStartSec=20min
+MemoryMax=256M
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+SystemCallArchitectures=native

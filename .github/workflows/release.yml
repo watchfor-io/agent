@@ -1,0 +1,84 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions: {}
+concurrency:
+  group: release-${{ github.ref }}
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    # A second pair of hands: the release environment waits for the
+    # watchfor-release account's approval before anything is published.
+    environment: release
+    permissions:
+      contents: write # the release and its assets
+      id-token: write # the provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+      # Pure-Go minisign, pinned. The secret key is written to a 0600 file for
+      # the duration of the job; goreleaser reads it through
+      # MINISIGN_SECRET_KEY_FILE (see signs: in .goreleaser.yaml).
+      - name: Set up minisign
+        run: |
+          go install aead.dev/minisign/cmd/minisign@v0.3.0
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          echo "MINISIGN_SECRET_KEY_FILE=$RUNNER_TEMP/minisign.key" >> "$GITHUB_ENV"
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Remove the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/minisign.key"
+      # Build provenance for every published asset, verifiable with
+      # `gh attestation verify <file> --repo watchfor-io/agent`.
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/checksums.txt
+
+  # The release is rebuilt from the tag, on a fresh runner, with the same
+  # toolchain and flags, and the binaries must match byte for byte. A
+  # release that cannot be reproduced is not one anyone should trust.
+  reproduce:
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+      - name: Rebuild and compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"; ver="${tag#v}"
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "-s -w -X main.Version=$ver" -o "rebuilt-$arch" ./cmd/watchfor-agent
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "watchfor-agent_${ver}_linux_${arch}.tar.gz" --output "release-$arch.tar.gz" --clobber
+            tar -xzf "release-$arch.tar.gz" watchfor-agent
+            if cmp -s watchfor-agent "rebuilt-$arch"; then
+              echo "linux/$arch: the published binary reproduces ($(sha256sum < watchfor-agent | cut -c1-16)…)"
+            else
+              echo "linux/$arch: the published binary does NOT reproduce"; exit 1
+            fi
+            rm -f watchfor-agent
+          done

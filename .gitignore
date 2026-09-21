@@ -1,0 +1,4 @@
+/watchfor-agent
+/dist/
+*.test
+*.out

@@ -1,0 +1,15 @@
+version: "2"
+linters:
+  default: none
+  enable: [errcheck, govet, staticcheck, unused, ineffassign, gosec]
+  settings:
+    errcheck:
+      exclude-functions:
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Fprint
+        - (*strings.Builder).WriteString
+        - (*strings.Builder).WriteRune
+        - (*strings.Builder).WriteByte
+    gosec:
+      excludes: [G304, G204] # a /proc reader opens computed paths; the one subprocess is systemctl with constant verbs
