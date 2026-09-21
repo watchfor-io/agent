@@ -87,6 +87,9 @@ func (s *screen) systemPane() string {
 		addr += stDim.Render(" on " + sum.PrimaryIface)
 	}
 	line("address", addr)
+	if len(sum.PublicAddresses) > 0 {
+		line("public", strings.Join(sum.PublicAddresses, stDim.Render(" · ")))
+	}
 	b.WriteString("\n" + stTitle.Render("Agent") + "\n")
 	line("version", Version+stDim.Render(" · "+runtime.GOOS+"/"+runtime.GOARCH))
 	line("service", s.svcStateStyled())

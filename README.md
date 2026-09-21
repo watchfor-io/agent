@@ -421,12 +421,17 @@ Outbound HTTPS only; nothing listens.
   timer), never from the running collector.
 - The cloud's metadata service (link-local, e.g. `169.254.169.254`): once
   an hour with the facts, **only** when the firmware says the machine is on
-  that cloud and does not carry the instance size itself (Google Compute
-  Engine, Azure, Oracle Cloud, Alibaba Cloud, Tencent Cloud, Scaleway;
-  AWS Nitro puts the type in the firmware, so nothing is asked there), and
-  only the instance-size path — never credentials. `facts.cloud_metadata:
-  false` switches the lookup off entirely; a blocked metadata endpoint just
-  times out after 0.7 s and the facts go without the size.
+  that cloud, and only two kinds of path — the instance size where the
+  firmware does not carry it (Google Compute Engine, Azure, Oracle Cloud,
+  Alibaba Cloud, Tencent Cloud, Scaleway; AWS Nitro puts the type in the
+  firmware) and the public addresses the cloud assigned to the instance
+  (AWS, Google Compute Engine, Azure, Alibaba Cloud, Tencent Cloud,
+  Scaleway, DigitalOcean, Hetzner, Vultr, Linode, OpenStack; Oracle Cloud
+  does not publish them) — never credentials. Only real public addresses
+  are kept: a private, link-local or malformed answer is dropped.
+  `facts.cloud_metadata: false` switches both lookups off entirely; a
+  blocked metadata endpoint just times out after 0.7 s and the facts go
+  without the size and the addresses.
 
 Rules that hold for the whole file:
 

@@ -3,6 +3,21 @@
 Releases are tagged `vX.Y.Z`; every tarball ships with a `checksums.txt`
 signed by the WatchFor release key. Dates are the day the tag was pushed.
 
+## Unreleased — 0.8.0
+
+- **The host's public addresses, from the cloud.** On a cloud instance the
+  elastic/floating IPv4 never appears on the interface (the provider NATs
+  it), so the agent asked its metadata service only for the instance size
+  and the dashboard could show a public address only as "the one batches
+  arrive from". With `facts.cloud_metadata` on the agent now also asks for
+  the addresses the cloud assigned from the outside — IPv4 and IPv6 — on
+  AWS, Google Compute Engine, Azure, Alibaba, Tencent, Scaleway,
+  DigitalOcean, Hetzner, Vultr, Linode and OpenStack (Oracle Cloud does
+  not publish them), and reports them as `public_addresses`. Only real
+  public addresses get through: a metadata answer that is private,
+  link-local or not an address at all is dropped. The screen shows them
+  under "address".
+
 ## 0.7.1 — 2026-09-21
 
 - The release's reproducibility check tripped over its own downloads: it

@@ -73,7 +73,8 @@ func (o Options) debug(msg string, args ...any) {
 
 // Collect gathers the slow-changing facts.
 func Collect(o Options) metric.Facts {
-	f := metric.Facts{CPUModel: cpuModel(), Hardware: hardware(o), Virtualization: virtualization()}
+	hw, public := cloudInfo(o)
+	f := metric.Facts{CPUModel: cpuModel(), Hardware: hw, PublicAddresses: public, Virtualization: virtualization()}
 	if st, err := procfs.ReadStat(); err == nil {
 		f.CPUCores = len(st.PerCPU)
 		f.BootTime = st.BootTime

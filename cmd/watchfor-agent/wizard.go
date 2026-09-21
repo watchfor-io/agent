@@ -339,7 +339,7 @@ func (w *wizard) section(key string) section {
 		return w.sectionProcesses()
 	case "cloud":
 		return w.sectionOnOff("cloud",
-			"on      ask the cloud for the instance size", "off     never contact the cloud metadata service",
+			"on      ask the cloud for the size and public address", "off     never contact the cloud metadata service",
 			w.o.CloudMetadata, func(v bool) { w.o.CloudMetadata = v })
 	case "auto":
 		return w.sectionOnOff("auto",
