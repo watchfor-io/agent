@@ -74,6 +74,10 @@ var metadataClient = &http.Client{
 // service says is not a size and is dropped.
 var instanceSize = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
+// macAddress is the only thing the EC2-style MAC listing may contribute
+// to a request path.
+var macAddress = regexp.MustCompile(`^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$`)
+
 func detectCloud(d dmi) *cloud {
 	has := func(field, s string) bool { return strings.Contains(strings.ToLower(field), strings.ToLower(s)) }
 	switch {
@@ -331,6 +335,9 @@ func ec2Style(ctx context.Context, base string, h map[string]string, top ...stri
 	}
 	for _, mac := range lines(metadataGet(ctx, base+"network/interfaces/macs/", h), 8) {
 		mac = strings.TrimSuffix(mac, "/")
+		if !macAddress.MatchString(mac) {
+			continue // the listing names the path segments; only a MAC is one
+		}
 		out = append(out, lines(metadataGet(ctx, base+"network/interfaces/macs/"+mac+"/ipv6s", h), 8)...)
 	}
 	return out
