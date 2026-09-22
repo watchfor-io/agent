@@ -3,7 +3,7 @@
 Releases are tagged `vX.Y.Z`; every tarball ships with a `checksums.txt`
 signed by the WatchFor release key. Dates are the day the tag was pushed.
 
-## Unreleased — 0.8.0
+## 0.8.0 — 2026-09-21
 
 - **The host's public addresses, from the cloud.** On a cloud instance the
   elastic/floating IPv4 never appears on the interface (the provider NATs

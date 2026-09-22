@@ -13,6 +13,11 @@ executed from configuration.
 
 Linux only for now (amd64, arm64). Windows is planned; macOS is not.
 
+What it is for, in plain words: [watchfor.io/server-monitoring](https://watchfor.io/server-monitoring).
+About the agent itself — what it collects, how it is secured, how to verify a
+release: [watchfor.io/agent](https://watchfor.io/agent). Dashboard-side docs:
+[watchfor.io/docs/hosts](https://watchfor.io/docs/hosts).
+
 ## Install
 
 ```sh
