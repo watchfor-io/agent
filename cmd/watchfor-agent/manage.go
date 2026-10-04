@@ -83,9 +83,22 @@ func runAutoUpdate(args []string) int {
 func runConfig(args []string) int {
 	fs := flag.NewFlagSet("config", flag.ContinueOnError)
 	configPath := fs.String("config", envOr("WATCHFOR_AGENT_CONFIG", defaultConfig), "path to agent.yml")
+	// `config init` has flags of its own (-server, -token-file, …) that the
+	// installer passes after the word init. Hand everything after init to
+	// init's own flag set; parsing it here first fails on -server.
+	var initArgs []string
+	for i, a := range args {
+		if a == "init" {
+			args, initArgs = args[:i:i], append([]string{"init"}, args[i+1:]...)
+			break
+		}
+	}
 	rest, err := parseAnywhere(fs, args)
 	if err != nil {
 		return exitUsage
+	}
+	if initArgs != nil {
+		rest = initArgs
 	}
 	usage := func() int {
 		fmt.Fprintf(os.Stderr, `usage: watchfor-agent config <command> [-config %s]
@@ -115,10 +128,14 @@ Restart the service after set: sudo systemctl restart watchfor-agent
 		tokenFile := ifs.String("token-file", "/etc/watchfor-agent/token", "where the host token is")
 		interval := ifs.String("interval", "1m", "push interval to start from")
 		spoolDir := ifs.String("spool-dir", config.DefaultSpoolDir, "where batches wait while the server is unreachable")
-		out := ifs.String("out", *configPath, "file to write")
+		ifs.StringVar(configPath, "config", *configPath, "path to agent.yml (the default for -out)")
+		out := ifs.String("out", "", "file to write (default: -config)")
 		force := ifs.Bool("force", false, "overwrite an existing file")
 		if err := ifs.Parse(rest[1:]); err != nil {
 			return exitUsage
+		}
+		if *out == "" {
+			*out = *configPath
 		}
 		if _, err := os.Stat(*out); err == nil && !*force {
 			fmt.Fprintf(os.Stderr, "config init: %s exists; pass -force to overwrite it\n", *out)
