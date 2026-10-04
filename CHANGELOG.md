@@ -3,6 +3,16 @@
 Releases are tagged `vX.Y.Z`; every tarball ships with a `checksums.txt`
 signed by the WatchFor release key. Dates are the day the tag was pushed.
 
+## 0.8.1 — 2026-10-04
+
+- **Fresh installs work again.** The installer writes the first agent.yml
+  with `watchfor-agent config init -server … -token-file … -spool-dir …
+  -out …`, but the flags after `init` were read by the `config` command
+  first and rejected ("flag provided but not defined: -server"), so every
+  install on a new host stopped at "could not write agent.yml". Upgrades
+  were not affected. `config init` now gets its own flags, and
+  `-config` before the subcommand still names the file it writes.
+
 ## 0.8.0 — 2026-09-21
 
 - **The host's public addresses, from the cloud.** On a cloud instance the
