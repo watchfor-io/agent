@@ -3,6 +3,15 @@
 Releases are tagged `vX.Y.Z`; every tarball ships with a `checksums.txt`
 signed by the WatchFor release key. Dates are the day the tag was pushed.
 
+## 0.8.2 — 2026-10-15
+
+- **Built with Go 1.27.2.** 0.8.1 and earlier were compiled with Go 1.26.8,
+  whose `net/http` and HTTP/2 code has known vulnerabilities (GO-2026-6611,
+  GO-2026-6613, GO-2026-6617). The agent talks HTTPS to WatchFor and to the
+  cloud metadata service, so every binary is rebuilt; behaviour is
+  unchanged. Agents update themselves to it on their own schedule.
+- Dependencies: `charmbracelet/x/ansi` 0.11.9 and its indirect updates.
+
 ## 0.8.1 — 2026-10-04
 
 - **Fresh installs work again.** The installer writes the first agent.yml
