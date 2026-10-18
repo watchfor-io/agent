@@ -121,16 +121,25 @@ func parseHelperLine(line string) (syscall.Statfs_t, error) {
 		}
 		return st, syscall.Errno(n)
 	case len(f) == 6 && f[0] == "ok":
-		var v [5]int64
-		for i := range v {
-			n, err := strconv.ParseInt(f[i+1], 10, 64)
+		// Block counts are unsigned, sizes signed — as in Statfs_t.
+		var blocks [3]uint64
+		for i := range blocks {
+			n, err := strconv.ParseUint(f[i+1], 10, 64)
+			if err != nil {
+				return st, fmt.Errorf("statfs helper: %q", line)
+			}
+			blocks[i] = n
+		}
+		var sizes [2]int64
+		for i := range sizes {
+			n, err := strconv.ParseInt(f[i+4], 10, 64)
 			if err != nil || n < 0 {
 				return st, fmt.Errorf("statfs helper: %q", line)
 			}
-			v[i] = n
+			sizes[i] = n
 		}
-		st.Blocks, st.Bfree, st.Bavail = uint64(v[0]), uint64(v[1]), uint64(v[2])
-		st.Bsize, st.Frsize = v[3], v[4]
+		st.Blocks, st.Bfree, st.Bavail = blocks[0], blocks[1], blocks[2]
+		st.Bsize, st.Frsize = sizes[0], sizes[1]
 		return st, nil
 	}
 	return st, fmt.Errorf("statfs helper: %q", line)

@@ -279,7 +279,9 @@ func (a *Agent) rejected(err error, bodies [][]byte) error {
 	}
 	wait := rec.Backoff()
 	a.pauseUntil = now.Add(wait)
-	a.keep(bodies)
+	if err := a.keep(bodies); err != nil {
+		a.o.Log.Error("spool refused the batch while the token is rejected", "spool", err)
+	}
 	a.o.Log.Warn("token rejected by the server; will try again",
 		"error", err, "reason", rec.Reason, "why", rec.Why(), "attempt", rec.Count, "of", StickyRejections, "retry_in", wait.String(),
 		"note", "if the rejection holds for over "+StickySpan.String()+" the agent stops by itself (exit 3)")
@@ -346,7 +348,9 @@ func (a *Agent) send(ctx context.Context, p *metric.Payload) error {
 		// the batch, do not ask yet. A plan pause keeps nothing.
 		a.deferred = true
 		if !a.pauseDrop {
-			a.keep(bodies)
+			if err := a.keep(bodies); err != nil {
+				a.o.Log.Error("spool refused the batch while paused", "spool", err)
+			}
 		}
 		return nil
 	}
