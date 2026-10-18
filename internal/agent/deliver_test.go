@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -131,5 +133,45 @@ func TestReplayBudget(t *testing.T) {
 		if (got+1)*ticksPerMin > perMin {
 			t.Errorf("interval %ds: %d requests a minute, ingest allows %d", sec, (got+1)*ticksPerMin, perMin)
 		}
+	}
+}
+
+// cron starts a new process every minute: a Retry-After (or a rejected
+// token's backoff) one run was given holds for the next runs too, and
+// their batches wait in the spool instead of asking at once.
+func TestOnceCarriesThePauseToTheNextRun(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Unix(1_800_000_000, 0)
+	clock := func() time.Time { return now }
+	sp, _ := spool.Open(dir, 1<<20)
+	run := func(sink Sink) (*Agent, error) {
+		a := newAgent(t, sink, sp)
+		a.o.StateDir, a.o.Now = dir, clock
+		return a, a.Once(context.Background(), 0)
+	}
+	busy := &fakeSink{fail: &push.StatusError{Code: 429, RetryAfter: 30 * time.Second}}
+	if _, err := run(busy); err == nil {
+		t.Fatal("a 429 run reported success")
+	}
+	ok := &fakeSink{}
+	now = now.Add(10 * time.Second) // cron's next minute, inside the 30 s
+	if _, err := run(ok); err != nil {
+		t.Fatalf("a run that waits out the pause: %v", err)
+	}
+	if ok.calls != 0 {
+		t.Fatalf("the next run asked the server %d times inside its Retry-After", ok.calls)
+	}
+	if n, _ := sp.Stats(); n != 2 {
+		t.Fatalf("spooled %d, want both batches", n)
+	}
+	now = now.Add(30 * time.Second)
+	if _, err := run(ok); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := sp.Stats(); n != 0 || ok.calls == 0 {
+		t.Fatalf("after the pause: %d calls, %d left in the spool", ok.calls, n)
+	}
+	if _, err := os.Stat(filepath.Join(dir, PauseFile)); !os.IsNotExist(err) {
+		t.Fatal("the pause record outlived the pause")
 	}
 }

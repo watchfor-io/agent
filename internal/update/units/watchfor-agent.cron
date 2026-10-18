@@ -3,4 +3,8 @@
 # samples a second apart (rates need both), pushes one batch and exits; the
 # spool catches up if the server was unreachable. Cron cannot go below a
 # minute; the plan minimum applies on top of that, so every minute is fine.
+# A run that went well prints nothing; MAILTO="" keeps cron from mailing
+# the warnings of a run that did not (`sudo watchfor-agent health` shows the
+# last push's answer).
+MAILTO=""
 * * * * * watchfor-agent /usr/local/bin/watchfor-agent once -config /etc/watchfor-agent/agent.yml

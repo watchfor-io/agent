@@ -220,8 +220,16 @@ func (a *Agent) applyAck(ack push.Ack) {
 // Once is the cron mode: rates need two samples, so it collects, waits gap,
 // collects again and sends only the second batch. The priming pass never
 // becomes a payload, so the one batch that is sent carries the facts.
+//
+// A pause the server asked for (Retry-After, a rejected token's backoff, a
+// plan pause, the backoff while it fails) outlives the process: it is
+// read from the state folder at the start and written back at the end,
+// so cron's next run honours it. A run that kept its batch back for such
+// a pause has done what it should and returns nil.
 func (a *Agent) Once(ctx context.Context, gap time.Duration) error {
 	defer a.round()()
+	a.loadPause()
+	defer a.savePause()
 	a.collect(ctx)
 	a.footprint(nil)
 	select {
@@ -232,10 +240,14 @@ func (a *Agent) Once(ctx context.Context, gap time.Duration) error {
 	if err := a.send(ctx, a.Collect(ctx)); err != nil {
 		return err
 	}
-	if !a.lastSent {
-		return ErrNotAccepted
+	switch {
+	case a.lastSent:
+		return nil
+	case a.deferred:
+		a.o.Log.Debug("a pause is in force; the batch waits", "until", a.pauseUntil.Format(time.RFC3339), "dropped", a.pauseDrop)
+		return nil
 	}
-	return nil
+	return ErrNotAccepted
 }
 
 func (a *Agent) tick(ctx context.Context) error {

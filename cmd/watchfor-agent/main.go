@@ -155,7 +155,14 @@ func runCollector(cmd, configPath string) int {
 		fmt.Fprintln(os.Stderr, "config:", err)
 		return exitError
 	}
-	log := newLogger(cfg.Log.Level)
+	level := cfg.Log.Level
+	if cmd == "once" && level == "info" {
+		// cron runs once every minute and mails (or logs) whatever it
+		// prints: a run that went well says nothing; warnings and errors
+		// still do. log.level: debug shows everything.
+		level = "warn"
+	}
+	log := newLogger(level)
 	facts := hostinfo.Options{Target: cfg.Server.URL, CloudMetadata: cfg.Facts.CloudMetadataEnabled() && cmd != "check", Log: log} // check promises no network
 
 	mods, err := buildModules(cfg)

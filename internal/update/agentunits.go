@@ -36,6 +36,7 @@ var shipped = map[string]map[string]bool{
 	},
 	"watchfor-agent.cron": {
 		"4b01f2bbb6eba1a3f53a34794d868cddcb79614c123ac4f0a5c7cabbac8c23f8": true, // 0.7.0 – 0.8.2
+		"fc173875181f7f6bae5db20b4045cab3b653ee770ab2a4c2478bdce621f07ec8": true, // 0.9.0: MAILTO=""
 	},
 }
 
