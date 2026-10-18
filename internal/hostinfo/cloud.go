@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"regexp"
@@ -64,8 +65,21 @@ var metadataHosts = map[string]string{
 	"openstack":    "http://169.254.169.254",
 }
 
+// metadataClient talks only to the link-local metadata service. It has its
+// own transport so HTTP(S)_PROXY in the unit's environment is ignored: the
+// IMDSv2 session token and the instance's facts must never travel through
+// a proxy (nor would a proxy reach 169.254.0.0/16 meaningfully). Every
+// stage is short: the whole facts collection must not stall on a host
+// that only looks like a cloud instance.
 var metadataClient = &http.Client{
-	Timeout:       700 * time.Millisecond,
+	Timeout: 700 * time.Millisecond,
+	Transport: &http.Transport{
+		Proxy:                  nil,
+		DialContext:            (&net.Dialer{Timeout: 500 * time.Millisecond}).DialContext,
+		ResponseHeaderTimeout:  700 * time.Millisecond,
+		DisableKeepAlives:      true, // a handful of requests once an hour
+		MaxResponseHeaderBytes: 16 << 10,
+	},
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 }
 

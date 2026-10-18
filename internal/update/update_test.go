@@ -186,6 +186,30 @@ func TestState(t *testing.T) {
 	}
 }
 
+// The audit's L1 repro: a symlink planted at the old fixed temp name and
+// at the hint itself must not let a root-run daemon overwrite the target.
+func TestWriteStateDoesNotFollowSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(t.TempDir(), "root-owned")
+	if err := os.WriteFile(victim, []byte("original\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"." + StateFile + ".tmp", StateFile} {
+		if err := os.Symlink(victim, filepath.Join(dir, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := WriteState(dir, "9.9.9"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(victim); string(b) != "original\n" {
+		t.Fatalf("WriteState wrote through a symlink: %q", b)
+	}
+	if v, _, ok := ReadState(dir); !ok || v != "9.9.9" {
+		t.Fatalf("ReadState = %q, %v", v, ok)
+	}
+}
+
 // release serves a fake GitHub: the API's latest release and the assets
 // of one version, signed with the test key.
 type release struct {

@@ -5,67 +5,85 @@ on:
 permissions: {}
 concurrency:
   group: release-${{ github.ref }}
+env:
+  # Exact versions. Both are installed with `go install pkg@version`, so the
+  # module contents are checked against the Go checksum database
+  # (sum.golang.org): a re-tagged or tampered release cannot slip in.
+  GORELEASER_VERSION: v2.18.3
+  MINISIGN_VERSION: v0.3.0
+  GOPROXY: https://proxy.golang.org
+  GOSUMDB: sum.golang.org
+  GOFLAGS: -mod=readonly
+
+# The pipeline, and why it is split this way:
+#
+#   build      GoReleaser builds the tarballs and uploads them as an
+#              UNSIGNED DRAFT release. It never sees the signing key.
+#   reproduce  A fresh runner rebuilds the binaries from the tag and checks
+#              the draft byte for byte: checksums.txt lists exactly the
+#              expected assets, every asset matches it, the binaries inside
+#              the tarballs are the rebuilt ones, install.sh is the tag's.
+#   sign       Behind the release environment's approval: the only job that
+#              gets the minisign key. No release code, no third-party
+#              actions, no write token; it signs the checksums.txt that
+#              reproduce verified and hands back the signature.
+#   publish    Checks the draft still holds exactly what was signed,
+#              verifies the signature with the key built into the tagged
+#              agent, attaches it, attests provenance and only then
+#              un-drafts the release.
 jobs:
-  goreleaser:
+  build:
     runs-on: ubuntu-latest
-    # A second pair of hands: the release environment waits for the
-    # watchfor-release account's approval before anything is published.
-    environment: release
     permissions:
-      contents: write # the release and its assets
-      id-token: write # the provenance attestation
-      attestations: write
+      contents: write # create the draft release and upload its assets
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      # Pure-Go minisign, pinned. The secret key is written to a 0600 file for
-      # the duration of the job; goreleaser reads it through
-      # MINISIGN_SECRET_KEY_FILE (see signs: in .goreleaser.yaml).
-      - name: Set up minisign
+          cache: false # a poisoned cache must not reach a release build
+      - name: Check the tag
         run: |
-          go install aead.dev/minisign/cmd/minisign@v0.3.0
-          umask 077
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
-          echo "MINISIGN_SECRET_KEY_FILE=$RUNNER_TEMP/minisign.key" >> "$GITHUB_ENV"
-        env:
-          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
-        with:
-          version: "~> v2"
-          args: release --clean
+          printf '%s\n' "$GITHUB_REF_NAME" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' \
+            || { echo "not a release tag: $GITHUB_REF_NAME"; exit 1; }
+      - name: Install GoReleaser
+        # Outside the checkout, so nothing it writes can mark the tree dirty.
+        working-directory: ${{ runner.temp }}
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install "github.com/goreleaser/goreleaser/v2@${GORELEASER_VERSION}"
+          "$RUNNER_TEMP/bin/goreleaser" --version
+      - name: Build and upload the unsigned draft
+        run: |
+          "$RUNNER_TEMP/bin/goreleaser" release --clean
+          cat dist/checksums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Remove the signing key
-        if: always()
-        run: rm -f "$RUNNER_TEMP/minisign.key"
-      # Build provenance for every published asset, verifiable with
-      # `gh attestation verify <file> --repo watchfor-io/agent`.
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: |
-            dist/*.tar.gz
-            dist/checksums.txt
 
-  # The release is rebuilt from the tag, on a fresh runner, with the same
-  # toolchain and flags, and the binaries must match byte for byte. A
-  # release that cannot be reproduced is not one anyone should trust.
+  # A release that cannot be reproduced is not one anyone should trust, and
+  # this check now runs while the release is still a draft.
   reproduce:
-    needs: goreleaser
+    needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # Read-only use: GitHub shows draft releases only to tokens with push
+      # access. Nothing in this job writes.
+      contents: write
+    outputs:
+      checksums: ${{ steps.check.outputs.checksums }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Rebuild and compare
+          cache: false
+      - name: Rebuild and compare with the draft
+        id: check
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -75,20 +93,140 @@ jobs:
           # single stray file in the tree changes the bytes. Everything this
           # job writes goes outside the checkout, and both binaries are built
           # before anything is downloaded.
-          out="$RUNNER_TEMP/reproduce"; mkdir -p "$out"
+          out="$RUNNER_TEMP/reproduce"; rel="$out/release"; mkdir -p "$rel"
           if [ -n "$(git status --porcelain)" ]; then
             echo "the checkout is not clean; a rebuild from it cannot match:"; git status --porcelain; exit 1
           fi
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "-s -w -X main.Version=$ver" -o "$out/rebuilt-$arch" ./cmd/watchfor-agent
           done
+
+          if [ "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" != "true" ]; then
+            echo "the release for $tag is not a draft; refusing to go on"; exit 1
+          fi
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$rel" --clobber \
+            --pattern checksums.txt --pattern install.sh --pattern "watchfor-agent_${ver}_linux_*.tar.gz"
+
+          # checksums.txt must list exactly these assets, and each must match.
+          expected="$(printf '%s\n' install.sh "watchfor-agent_${ver}_linux_amd64.tar.gz" "watchfor-agent_${ver}_linux_arm64.tar.gz" | sort)"
+          listed="$(awk '{print $2}' "$rel/checksums.txt" | sed 's/^\*//' | sort)"
+          if [ "$listed" != "$expected" ]; then
+            printf 'checksums.txt lists:\n%s\nexpected:\n%s\n' "$listed" "$expected"; exit 1
+          fi
+          (cd "$rel" && sha256sum --strict -c checksums.txt)
+          cmp "$rel/install.sh" packaging/install.sh || { echo "install.sh in the draft is not the tag's packaging/install.sh"; exit 1; }
+
           for arch in amd64 arm64; do
-            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "watchfor-agent_${ver}_linux_${arch}.tar.gz" --output "$out/release-$arch.tar.gz" --clobber
-            tar -xzf "$out/release-$arch.tar.gz" -C "$out" watchfor-agent
+            tar -xzf "$rel/watchfor-agent_${ver}_linux_${arch}.tar.gz" -C "$out" watchfor-agent
             if cmp -s "$out/watchfor-agent" "$out/rebuilt-$arch"; then
-              echo "linux/$arch: the published binary reproduces ($(sha256sum < "$out/watchfor-agent" | cut -c1-16)…)"
+              echo "linux/$arch: the draft's binary reproduces ($(sha256sum < "$out/watchfor-agent" | cut -c1-16)…)"
             else
-              echo "linux/$arch: the published binary does NOT reproduce"; exit 1
+              echo "linux/$arch: the draft's binary does NOT reproduce"; exit 1
             fi
             rm -f "$out/watchfor-agent"
           done
+          echo "verified checksums.txt:"; cat "$rel/checksums.txt"
+          echo "checksums=$(base64 -w0 < "$rel/checksums.txt")" >> "$GITHUB_OUTPUT"
+
+  sign:
+    needs: reproduce
+    runs-on: ubuntu-latest
+    # A second pair of hands: the release environment waits for the
+    # watchfor-release account's approval, and only then hands out the key.
+    # The reviewer can read the reproduce log (and the checksums it
+    # verified) before approving.
+    environment: release
+    permissions:
+      contents: read # the sparse checkout of go.mod below
+    outputs:
+      minisig: ${{ steps.sign.outputs.minisig }}
+    steps:
+      # Only go.mod, to pick the toolchain; no release code is checked out.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: go.mod
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      # Pure-Go minisign at an exact version, checked against sum.golang.org,
+      # installed before the key exists on the runner.
+      - name: Install minisign
+        working-directory: ${{ runner.temp }}
+        run: GOBIN="$RUNNER_TEMP/bin" go install "aead.dev/minisign/cmd/minisign@${MINISIGN_VERSION}"
+      - name: Sign the verified checksums
+        id: sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          CHECKSUMS_B64: ${{ needs.reproduce.outputs.checksums }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"; ver="${tag#v}"
+          work="$RUNNER_TEMP/sign"; mkdir -p "$work"
+          umask 077
+          trap 'rm -f "$work/minisign.key"' EXIT
+          printf '%s' "$CHECKSUMS_B64" | base64 -d > "$work/checksums.txt"
+          [ -s "$work/checksums.txt" ] || { echo "no checksums from reproduce"; exit 1; }
+          cat "$work/checksums.txt"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$work/minisign.key"
+          "$RUNNER_TEMP/bin/minisign" -S -W -s "$work/minisign.key" \
+            -t "watchfor-agent ${ver} checksums" \
+            -x "$work/checksums.txt.minisig" -m "$work/checksums.txt"
+          rm -f "$work/minisign.key"
+          echo "minisig=$(base64 -w0 < "$work/checksums.txt.minisig")" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: [reproduce, sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # attach the signature, un-draft
+      id-token: write # the provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Check the draft against the signature, attach it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECKSUMS_B64: ${{ needs.reproduce.outputs.checksums }}
+          MINISIG_B64: ${{ needs.sign.outputs.minisig }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"; ver="${tag#v}"
+          rel="$RUNNER_TEMP/publish"; mkdir -p "$rel"
+          # The agent built from the tag checks the signature exactly as an
+          # installed agent would (built-in key, trusted comment).
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/watchfor-agent" ./cmd/watchfor-agent
+          if [ "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" != "true" ]; then
+            echo "the release for $tag is no longer a draft; refusing to go on"; exit 1
+          fi
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$rel" --clobber \
+            --pattern checksums.txt --pattern install.sh --pattern "watchfor-agent_${ver}_linux_*.tar.gz"
+          printf '%s' "$CHECKSUMS_B64" | base64 -d > "$RUNNER_TEMP/checksums.signed"
+          cmp "$rel/checksums.txt" "$RUNNER_TEMP/checksums.signed" \
+            || { echo "the draft's checksums.txt changed after it was verified"; exit 1; }
+          printf '%s' "$MINISIG_B64" | base64 -d > "$rel/checksums.txt.minisig"
+          (cd "$rel" && "$RUNNER_TEMP/watchfor-agent" verify -checksums checksums.txt \
+            install.sh "watchfor-agent_${ver}_linux_amd64.tar.gz" "watchfor-agent_${ver}_linux_arm64.tar.gz") | tee "$RUNNER_TEMP/verify.txt"
+          grep -Fqx "signature ok: checksums.txt (watchfor-agent ${ver} checksums)" "$RUNNER_TEMP/verify.txt" \
+            || { echo "the trusted comment does not name ${ver}"; exit 1; }
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "$rel/checksums.txt.minisig"
+          echo "RELEASE_DIR=$rel" >> "$GITHUB_ENV"
+      # Build provenance for every published asset, verifiable with
+      # `gh attestation verify <file> --repo watchfor-io/agent`.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ${{ env.RELEASE_DIR }}/*.tar.gz
+            ${{ env.RELEASE_DIR }}/checksums.txt
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

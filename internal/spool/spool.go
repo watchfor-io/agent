@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/watchfor-io/agent/internal/safefile"
 )
 
 // Spool is the buffer directory. Every operation takes the one lock, so
@@ -87,14 +89,21 @@ func (s *Spool) Put(data []byte) error {
 
 // Next returns the oldest batch, or "" when the spool is empty. The caller
 // removes it after a successful send so a crash mid-send replays it.
+//
+// Only regular files are batches. A symlink, FIFO or device that turns up
+// under a batch name was not written by Put — it is unlinked (the link,
+// never its target) instead of read, so a FIFO cannot hang the agent and
+// a link cannot make it upload a file it was pointed at. The read itself
+// does not follow links, does not block, and is capped at the spool size.
 func (s *Spool) Next() (name string, data []byte, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.purgeIrregular()
 	names := s.names()
 	if len(names) == 0 {
 		return "", nil, nil
 	}
-	data, err = os.ReadFile(filepath.Join(s.dir, names[0]))
+	data, err = safefile.ReadFile(filepath.Join(s.dir, names[0]), s.max)
 	if err != nil {
 		return names[0], nil, err // the caller may want to get rid of it
 	}
@@ -114,7 +123,7 @@ func (s *Spool) Stats() (count int, bytes int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, n := range s.names() {
-		if info, err := os.Stat(filepath.Join(s.dir, n)); err == nil {
+		if info, err := os.Lstat(filepath.Join(s.dir, n)); err == nil {
 			count++
 			bytes += info.Size()
 		}
@@ -122,6 +131,14 @@ func (s *Spool) Stats() (count int, bytes int64) {
 	return count, bytes
 }
 
+// batchName is a name Put could have written; whether the entry is a
+// regular file is checked separately.
+func batchName(n string) bool {
+	return strings.HasSuffix(n, ".gz") && !strings.HasPrefix(n, ".")
+}
+
+// names lists the batches, oldest first: regular files only (the type
+// comes from the directory entry, i.e. lstat — a symlink is not followed).
 func (s *Spool) names() []string {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -129,7 +146,7 @@ func (s *Spool) names() []string {
 	}
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".gz") && !strings.HasPrefix(e.Name(), ".") {
+		if e.Type().IsRegular() && batchName(e.Name()) {
 			names = append(names, e.Name())
 		}
 	}
@@ -137,12 +154,26 @@ func (s *Spool) names() []string {
 	return names
 }
 
+// purgeIrregular unlinks entries with a batch name that are not regular
+// files (symlinks, FIFOs, sockets, devices). Directories are left alone.
+func (s *Spool) purgeIrregular() {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if batchName(e.Name()) && !e.Type().IsRegular() && !e.IsDir() {
+			_ = os.Remove(filepath.Join(s.dir, e.Name()))
+		}
+	}
+}
+
 func (s *Spool) trim() {
 	names := s.names()
 	var total int64
 	sizes := make([]int64, len(names))
 	for i, n := range names {
-		if info, err := os.Stat(filepath.Join(s.dir, n)); err == nil {
+		if info, err := os.Lstat(filepath.Join(s.dir, n)); err == nil {
 			sizes[i] = info.Size()
 			total += sizes[i]
 		}
@@ -163,7 +194,7 @@ func Stats(dir string) (count int, bytes int64) {
 		return 0, 0
 	}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".gz") || strings.HasPrefix(e.Name(), ".") {
+		if !e.Type().IsRegular() || !batchName(e.Name()) {
 			continue
 		}
 		if info, err := e.Info(); err == nil {

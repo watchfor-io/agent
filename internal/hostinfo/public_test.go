@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The filter is the whole safety of the feature: a metadata service is
@@ -146,5 +147,25 @@ func TestCloudPublicAddressesFromMetadata(t *testing.T) {
 	// the lookup is off: nothing is asked, nothing reported
 	if _, public := cloudInfo(Options{CloudMetadata: false}); public != nil {
 		t.Errorf("lookup off but got %v", public)
+	}
+}
+
+// HTTP(S)_PROXY in the unit's environment must not route the metadata
+// requests (and the IMDSv2 token) through a proxy.
+func TestMetadataClientIgnoresProxyEnv(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+	t.Setenv("http_proxy", "http://proxy.invalid:3128")
+	tr, ok := metadataClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("metadata client uses %T, want its own *http.Transport", metadataClient.Transport)
+	}
+	if tr.Proxy != nil {
+		req, _ := http.NewRequest(http.MethodGet, "http://169.254.169.254/latest/meta-data/", nil)
+		if u, _ := tr.Proxy(req); u != nil {
+			t.Fatalf("metadata request would go through proxy %s", u)
+		}
+	}
+	if metadataClient.Timeout <= 0 || metadataClient.Timeout > time.Second {
+		t.Errorf("metadata client timeout %s, want short", metadataClient.Timeout)
 	}
 }
