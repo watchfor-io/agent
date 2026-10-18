@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -133,4 +134,66 @@ func findMount(b *metric.Batch, point string) (metric.Sample, bool) {
 		}
 	}
 	return metric.Sample{}, false
+}
+
+// The daemon asks local disks itself and only the mounts that can hang
+// through a helper, so a dead NFS server never leaves a thread of its own
+// stuck in the kernel (which would keep it from finishing a stop).
+func TestDaemonSendsOnlyNetworkMountsToTheHelper(t *testing.T) {
+	root := t.TempDir()
+	local, nfs := filepath.Join(root, "data"), filepath.Join(root, "nfs")
+	for _, d := range []string{local, nfs} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fakeMounts(t, "/dev/sda1 "+local+" ext4 rw 0 0", "srv:/export "+nfs+" nfs4 rw,hard 0 0")
+	t.Setenv("WF_TEST_HANG", nfs)
+	exe, _ := os.Executable()
+	state := t.TempDir()
+	IsolateNetwork(exe)
+	RememberHungIn(state)
+	t.Cleanup(func() { Isolate(""); RememberHungIn("") })
+	oldKill := killHelper
+	killHelper = func(*os.Process) {}
+	t.Cleanup(func() { killHelper = oldKill })
+	var asked []string
+	m, err := New(testutil.Node(t, "io: false\nmounts: ["+local+", "+nfs+"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mod := m.(*module)
+	mod.stat.timeout = 300 * time.Millisecond
+	mod.stat.fn = func(p string, st *syscall.Statfs_t) error { // in-process calls
+		asked = append(asked, p)
+		st.Blocks, st.Bfree, st.Bavail, st.Bsize, st.Frsize = 100, 50, 50, 4096, 4096
+		return nil
+	}
+	b := metric.NewBatch(time.Now())
+	if err := mod.Collect(context.Background(), b); err == nil || !strings.Contains(err.Error(), nfs) {
+		t.Fatalf("err = %v", err)
+	}
+	if strings.Join(asked, ",") != local {
+		t.Fatalf("asked in process: %v, want only the local disk", asked)
+	}
+	recs := (&hungStore{dir: state}).read()
+	if len(recs) != 1 || recs[0].pid == os.Getpid() {
+		t.Fatalf("record %+v: the stuck call should be a helper's", recs)
+	}
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(recs[0].pid); err == nil {
+			_ = p.Kill()
+			_, _ = p.Wait()
+		}
+	})
+	for _, fs := range []string{"nfs", "nfs4", "cifs", "fuse.sshfs", "fuseblk", "ceph", "9p"} {
+		if !mayHang(fs) {
+			t.Errorf("%s: may hang", fs)
+		}
+	}
+	for _, fs := range []string{"ext4", "xfs", "btrfs", "zfs", "vfat"} {
+		if mayHang(fs) {
+			t.Errorf("%s: a local filesystem", fs)
+		}
+	}
 }

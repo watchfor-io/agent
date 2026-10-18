@@ -44,16 +44,38 @@ const HungFile = "hung-mounts"
 
 var (
 	settingsMu sync.Mutex
-	helperExe  string // set: one-shot commands use the helper
+	helperExe  string // set: statfs goes through the helper
+	helperNet  bool   // only for network and FUSE filesystems
 	hungDir    string // set: hung mounts are remembered here
 )
 
-// Isolate makes statfs run in a helper process (exe is the agent binary)
-// for modules built after the call — for commands that must end.
+// Isolate makes every statfs run in a helper process (exe is the agent
+// binary) for modules built after the call — for commands that must end.
 func Isolate(exe string) {
 	settingsMu.Lock()
 	defer settingsMu.Unlock()
-	helperExe = exe
+	helperExe, helperNet = exe, false
+}
+
+// IsolateNetwork is Isolate for the filesystems that can hang — network
+// and FUSE mounts — only: the daemon asks local disks itself, and a mount
+// that hangs then costs it a helper process, not a thread that would keep
+// it from ever finishing a stop.
+func IsolateNetwork(exe string) {
+	settingsMu.Lock()
+	defer settingsMu.Unlock()
+	helperExe, helperNet = exe, true
+}
+
+// mayHang is a filesystem whose answers depend on something other than a
+// local disk: a server (NFS, SMB, Ceph, Gluster, 9p, AFS, Lustre …) or a
+// userspace process (FUSE).
+func mayHang(fsType string) bool {
+	switch fsType {
+	case "cifs", "smb3", "smbfs", "ceph", "glusterfs", "9p", "afs", "lustre", "gpfs", "beegfs", "davfs", "ocfs2", "gfs2", "virtiofs":
+		return true
+	}
+	return strings.HasPrefix(fsType, "nfs") || strings.HasPrefix(fsType, "fuse")
 }
 
 // RememberHungIn keeps the record of hung mounts in dir (the state
@@ -64,10 +86,10 @@ func RememberHungIn(dir string) {
 	hungDir = dir
 }
 
-func settings() (exe, dir string) {
+func settings() (exe string, netOnly bool, dir string) {
 	settingsMu.Lock()
 	defer settingsMu.Unlock()
-	return helperExe, hungDir
+	return helperExe, helperNet, hungDir
 }
 
 // Helper is the helper's side: statfs each point in turn and print the
@@ -117,15 +139,16 @@ func parseHelperLine(line string) (syscall.Statfs_t, error) {
 // helperAll asks the mounts at idx through helper processes, one at a
 // time per helper, each answer within s.timeout. A mount that does not
 // answer is marked hung (with the stuck helper's pid) and the rest go to a
-// fresh helper. Returns false when no helper could be started.
-func (s *statfser) helperAll(ctx context.Context, mounts []procfs.Mount, idx []int, out []statResult) bool {
+// fresh helper. rest is what is left unasked because no helper could be
+// started — for the caller to ask itself.
+func (s *statfser) helperAll(ctx context.Context, mounts []procfs.Mount, idx []int, out []statResult) (rest []int) {
 helpers:
 	for len(idx) > 0 {
 		if ctx.Err() != nil {
 			for _, i := range idx {
 				out[i].err = ctx.Err()
 			}
-			return true
+			return nil
 		}
 		args := []string{HelperArg}
 		for _, i := range idx {
@@ -134,10 +157,10 @@ helpers:
 		cmd := exec.Command(s.exe, args...) // #nosec G204 -- the agent's own binary, mount points as arguments
 		pipe, err := cmd.StdoutPipe()
 		if err != nil {
-			return false
+			return idx
 		}
 		if err := cmd.Start(); err != nil {
-			return false
+			return idx
 		}
 		lines := make(chan string)
 		go func() {
@@ -184,13 +207,13 @@ helpers:
 				for _, i := range idx[done:] {
 					out[i].err = ctx.Err()
 				}
-				return true
+				return nil
 			}
 		}
 		go func() { _ = cmd.Wait() }()
-		return true
+		return nil
 	}
-	return true
+	return nil
 }
 
 // killHelper ends a helper that did not answer. Over a hard NFS mount

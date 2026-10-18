@@ -91,6 +91,11 @@ func run(args []string) int {
 		// Every command but the daemon must end on time, even with a dead
 		// hard mount on the machine: statfs goes through helper processes.
 		disk.Isolate(disk.SelfExe())
+	} else {
+		// The daemon asks local disks itself; network and FUSE mounts, the
+		// ones that can hang, through a helper, so a stuck call never
+		// keeps the daemon from stopping.
+		disk.IsolateNetwork(disk.SelfExe())
 	}
 	if strings.HasPrefix(cmd, "-") && cmd != "-version" && cmd != "--version" && cmd != "-h" && cmd != "--help" && cmd != "-help" {
 		// options first: `-config x.yml check` is `check -config x.yml`,

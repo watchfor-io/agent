@@ -49,18 +49,20 @@ type statfser struct {
 	hungUntil map[string]time.Time // do not ask before this
 
 	exe      string          // set: ask through helper processes (see isolate.go)
+	netOnly  bool            // the helper only for filesystems that may hang
 	store    *hungStore      // set: hung mounts remembered across runs
 	recorded map[string]bool // the mounts in the record at this round's start
 }
 
 func newStatfser() *statfser {
-	exe, dir := settings()
+	exe, netOnly, dir := settings()
 	var store *hungStore
 	if dir != "" {
 		store = &hungStore{dir: dir}
 	}
 	return &statfser{
 		exe:       exe,
+		netOnly:   netOnly,
 		store:     store,
 		fn:        syscall.Statfs,
 		timeout:   statfsTimeout,
@@ -81,6 +83,7 @@ func (s *statfser) statAll(ctx context.Context, mounts []procfs.Mount) []statRes
 	s.prune()
 	out := make([]statResult, len(mounts))
 	ask := make([]int, 0, len(mounts))
+	var viaHelper []int
 	var stuck map[string]int
 	if s.store != nil {
 		stuck = s.store.live() // one read of the record per round
@@ -99,7 +102,7 @@ func (s *statfser) statAll(ctx context.Context, mounts []procfs.Mount) []statRes
 			out[i].err = errHung // an earlier run's call is still stuck on it
 			continue
 		}
-		if s.exe != "" {
+		if s.exe != "" && (!s.netOnly || mayHang(mt.FSType)) {
 			s.mu.Lock()
 			waiting := s.now().Before(s.hungUntil[mt.Point])
 			s.mu.Unlock()
@@ -107,11 +110,13 @@ func (s *statfser) statAll(ctx context.Context, mounts []procfs.Mount) []statRes
 				out[i].err = errHung
 				continue
 			}
+			viaHelper = append(viaHelper, i)
+			continue
 		}
 		ask = append(ask, i)
 	}
-	if s.exe != "" && s.helperAll(ctx, mounts, ask, out) {
-		return out
+	if len(viaHelper) > 0 {
+		ask = append(ask, s.helperAll(ctx, mounts, viaHelper, out)...) // what no helper could ask: here after all
 	}
 	idx := make(chan int)
 	var wg sync.WaitGroup
