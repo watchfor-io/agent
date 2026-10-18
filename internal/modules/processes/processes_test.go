@@ -4,6 +4,9 @@ package processes
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,5 +63,33 @@ func TestWatchValidation(t *testing.T) {
 	}
 	if _, err := New(testutil.Node(t, "top: 500")); err == nil {
 		t.Error("top out of range must be rejected")
+	}
+}
+
+// A cmdline watch matches the whole command line (up to 4 KB), not only
+// its first 256 bytes: a JVM's main class comes after a long classpath.
+func TestCmdlineWatchSeesPastTheFirst256Bytes(t *testing.T) {
+	src := testutil.ProcRoot(t)
+	root := t.TempDir()
+	if err := os.CopyFS(root, os.DirFS(src)); err != nil {
+		t.Fatal(err)
+	}
+	argv := "java\x00-cp\x00" + strings.Repeat("/opt/lib/x.jar:", 40) + "\x00com.example.NeedleLate\x00"
+	if err := os.WriteFile(filepath.Join(root, "4242", "cmdline"), []byte(argv), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := procfs.Root
+	procfs.Root = root
+	t.Cleanup(func() { procfs.Root = old })
+	m, err := New(testutil.Node(t, "watch:\n  - cmdline: com.example.NeedleLate\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := metric.NewBatch(time.Now())
+	if err := m.Collect(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := testutil.Find(b, "procwatch.count", metric.Labels{"watch": "com.example.NeedleLate"}); !ok || s.V != 1 {
+		t.Errorf("watch on a late argument = %+v", s)
 	}
 }

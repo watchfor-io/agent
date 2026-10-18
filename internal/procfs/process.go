@@ -83,8 +83,16 @@ func ReadProcess(pid int) (Process, error) {
 }
 
 // Cmdline returns the process command line with NULs as spaces, capped so a
-// pathological argv cannot bloat a batch.
+// pathological argv cannot bloat a batch, and cleaned for showing.
 func Cmdline(pid int, max int) string {
+	return Clean(CmdlineRaw(pid, make([]byte, max)))
+}
+
+// CmdlineRaw is the command line read into buf (its length is the cap),
+// NULs as spaces, not cleaned and not cut to Clean's length — for matching
+// a watch, never for showing or sending. A caller walking every pid on
+// every tick reuses one buffer.
+func CmdlineRaw(pid int, buf []byte) string {
 	// Read only what is kept: a process may give itself megabytes of argv,
 	// and this runs for every pid on every tick.
 	f, err := os.Open(path(strconv.Itoa(pid), "cmdline"))
@@ -92,12 +100,11 @@ func Cmdline(pid int, max int) string {
 		return ""
 	}
 	defer f.Close()
-	b := make([]byte, max)
-	n, _ := io.ReadFull(f, b)
+	n, _ := io.ReadFull(f, buf)
 	if n == 0 {
 		return ""
 	}
-	return Clean(strings.TrimSpace(strings.ReplaceAll(string(b[:n]), "\x00", " ")))
+	return strings.TrimSpace(strings.ReplaceAll(string(buf[:n]), "\x00", " "))
 }
 
 // parseStat handles the one awkward thing about /proc/<pid>/stat: comm is

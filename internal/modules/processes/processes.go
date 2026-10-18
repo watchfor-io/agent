@@ -46,7 +46,13 @@ func (w Watch) label() string {
 
 const (
 	defaultTop = 10
-	cmdlineCap = 256
+	// cmdlineCap is what a command line shown or sent may be (config
+	// detect's examples); cmdlineMatchCap is how much of it a cmdline:
+	// watch is matched against — a JVM's main class comes after a long
+	// classpath, well past the first 256 bytes. Only the configured
+	// string is ever sent, as the watch label.
+	cmdlineCap      = 256
+	cmdlineMatchCap = 4096
 )
 
 type cpuKey struct {
@@ -109,6 +115,10 @@ func (m *module) Collect(_ context.Context, b *metric.Batch) error {
 	elapsed := now.Sub(m.prevAt).Seconds()
 	next := make(map[int]cpuKey, len(pids))
 	entries := make([]entry, 0, len(pids))
+	var buf []byte
+	if m.cmdline {
+		buf = make([]byte, cmdlineMatchCap)
+	}
 	var total, running, sleeping, blocked, zombie, stopped, threads int
 
 	for _, pid := range pids {
@@ -137,7 +147,7 @@ func (m *module) Collect(_ context.Context, b *metric.Batch) error {
 		}
 		next[pid] = cpuKey{ticks: p.CPUTicks(), start: p.StartTicks}
 		if m.cmdline {
-			e.cmdline = procfs.Cmdline(pid, cmdlineCap)
+			e.cmdline = procfs.CmdlineRaw(pid, buf)
 		}
 		entries = append(entries, e)
 	}

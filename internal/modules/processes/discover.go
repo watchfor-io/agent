@@ -122,6 +122,7 @@ func Matches(w Watch) int {
 	}
 	own := newOwners()
 	n := 0
+	buf := make([]byte, cmdlineMatchCap)
 	for _, pid := range pids {
 		p, err := procfs.ReadProcess(pid)
 		if err != nil {
@@ -130,7 +131,7 @@ func Matches(w Watch) int {
 		if w.Name != "" && p.Comm != w.Name {
 			continue
 		}
-		if w.Cmdline != "" && !strings.Contains(procfs.Cmdline(pid, cmdlineCap), w.Cmdline) {
+		if w.Cmdline != "" && !strings.Contains(procfs.CmdlineRaw(pid, buf), w.Cmdline) {
 			continue
 		}
 		if w.User != "" && own.user(p) != w.User {
