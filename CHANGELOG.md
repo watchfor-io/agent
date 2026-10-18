@@ -3,7 +3,7 @@
 Releases are tagged `vX.Y.Z`; every tarball ships with a `checksums.txt`
 signed by the WatchFor release key. Dates are the day the tag was pushed.
 
-## Unreleased
+## 0.9.0 — 2026-10-18
 
 - **Hosts with many interfaces no longer lose their batches.** A host with
   about 1300 interfaces (a Kubernetes node has one per pod) made a batch of
