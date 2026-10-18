@@ -5,6 +5,83 @@ signed by the WatchFor release key. Dates are the day the tag was pushed.
 
 ## Unreleased
 
+- **Hosts with many interfaces no longer lose their batches.** A host with
+  about 1300 interfaces (a Kubernetes node has one per pod) made a batch of
+  over 10 000 samples; ingest refused it with 413 and the agent dropped it,
+  every time. Requests now carry at most 5000 samples (256 KiB), a 413 halves
+  the request and sends the halves, and the default interface list leaves
+  out the CNI plumbing too: Calico (`cali*`, `vxlan.calico`, `tunl*`),
+  Flannel, `cni*`, `kube-ipvs*`, Cilium, LXC/LXD (`lxc*`), Weave and libvirt's
+  `vnet*`.
+- **Catching up after an outage takes minutes, not hours.** The agent
+  replayed four spooled batches per push, so a day offline at one batch a
+  minute took about six hours to send. A replay request now merges
+  consecutive spooled batches (up to 5000 samples), and the number of
+  replay requests follows the per-host budget ingest allows at the
+  interval in use.
+- **A clock stepped backwards no longer throws away the newest batch.**
+  Spool files were named by the clock: after a backward step a new batch
+  sorted as the oldest, was trimmed at once when the spool was full — while
+  the log said "batch spooled" — and replayed out of order. They are now
+  numbered in sequence, continued across restarts; the batch just written
+  is never trimmed; and when the disk is full the oldest batches make room
+  for the newest instead of the new one being refused. Batches given up to
+  make room are logged.
+- **A dead hard mount can no longer hang `once`, `config init` or a
+  stopping daemon.** A `statfs` stuck on a hard NFS/SMB/FUSE mount whose
+  server is gone keeps its thread in the kernel, so the process never
+  finishes exiting: `once` did its work and then stayed behind as a zombie
+  (one more every minute under cron), and the installer waited for ever on
+  `config init`. Commands that must end — and the daemon, for network and
+  FUSE mounts — now ask through a helper process and leave one that does
+  not answer behind; the mount is remembered in the state folder
+  (`hung-mounts`) and not asked again while that helper is stuck.
+- **Hosts that 0.8 stopped over a plan pause start again.** 0.8 counted
+  ingest's `plan_forbidden` as a rejected token and, after two hours,
+  stopped for good (exit 3) — and kept stopping on every start, even after
+  the plan was restored. The rejected-token record now keeps the server's
+  reason; a record written for a plan pause, or older than the token file,
+  is removed at start; one without a reason (written by 0.8) needs one
+  more rejection before it counts. `upgrade` starts a service that had
+  stopped itself with exit 3, so the new release can look again, and
+  `health` shows the record with a repair that removes a stale one. A 0.8
+  host already stopped that way starts on `sudo systemctl restart
+  watchfor-agent`, a re-run of the installer, or a reboot.
+- **Reinstalling over a kept config works.** `--uninstall --keep-config`
+  hands the kept token to root (its account is deleted, and the uid may go
+  to the next account created); a reinstall then left it root's, the agent
+  could not read it and restarted every five seconds — while the installer
+  printed "running". The installer now gives the token back to the service
+  account, and reports success only once the service has stayed up for a
+  few seconds; otherwise it fails with the service's last log lines.
+- **An `agent.yml` others can write is refused.** Whoever can change
+  `agent.yml` can point `server.url` at their own server and receive the
+  token with the next push, yet a world-writable file owned by another
+  user loaded fine and `health` only warned. `run` and `once` now refuse a
+  group- or world-writable `agent.yml`, and a folder around it or the token
+  file that others may write (a sticky folder like `/tmp` is fine);
+  `health` fails on those and on an `agent.yml` owned by another account,
+  and repairs the installed file (0644, root).
+- **A malformed token file is a config error, not an outage.** A token file
+  with a second line or a stray control character failed every push with
+  an invalid Authorization header, which the agent took for network
+  trouble and retried into the spool; a FIFO in its place blocked the
+  start. Both are now refused at load with the reason.
+- **Cron honours what the server said.** Each `once` is a new process, so
+  a `Retry-After`, the backoff after a rejected token or while the server
+  fails, and a plan pause were forgotten a minute later and the server
+  asked again. They are now kept in the state folder (`pause-state`), the
+  next run waits with its batch in the spool, and such a run exits 0. At
+  `log.level: info` a run that went well prints nothing (warnings and
+  errors still do), and the cron file sets `MAILTO=""`.
+- **A redirect no longer drops the batch.** A `3xx` (a proxy, a moved URL)
+  dropped the batch; it is now spooled and retried, never followed, and the
+  log says where it pointed. Error bodies from the server are cleaned of
+  control characters and cut to 200 bytes before they reach the log.
+- **`processes.watch` with `cmdline:` sees the whole command line.** Only
+  the first 256 bytes were matched, so a JVM's main class after a long
+  classpath was never found. Matching now reads up to 4 KB; nothing more is
+  sent.
 - **Container processes no longer show up as the agent's user.** A
   container without a user namespace runs its own uid 999 as host uid 999,
   and `useradd --system` on the host also hands out 999 first — so on a

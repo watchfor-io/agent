@@ -29,7 +29,12 @@ creates the unprivileged `watchfor-agent` user, writes the token to
 `/etc/watchfor-agent/token` with mode 0600 and enables the systemd unit.
 Re-running it with a new `--token` puts the token in place and restarts
 the agent on it; a leftover `/etc/cron.d/watchfor-agent` is removed, since
-the service now runs the agent.
+the service now runs the agent. It reports success only once the service
+has stayed up for a few seconds — an agent that exits at once (a token it
+cannot read, an `agent.yml` it refuses) makes the installer fail with the
+service's last log lines instead of printing "running". A token file kept
+from an earlier install (`--uninstall --keep-config` hands what it keeps to
+root) is given back to the service account.
 
 The account gets the first uid in **60578–61183** that no account, no
 group and no running process has. systemd documents that band as unused:
@@ -155,15 +160,29 @@ shortest interval your plan allows applies on top of that. A run never
 takes longer than 40 seconds (collection, push and spool catch-up
 included; at 55 it is ended outright), only one agent runs per state
 folder (`/var/lib/watchfor-agent/agent.lock`), so a run that hangs on a
-dead network or mount cannot pile up behind it, and it exits 1 when the
-batch was not accepted. With the systemd service installed as well, the
-cron run steps aside — but keep one of the two; `health` points it out.
+dead network cannot pile up behind it, and it exits 1 when the batch was
+not accepted. A dead hard mount (NFS, SMB, FUSE) cannot hold a run either:
+`once` asks the filesystems through a helper process and leaves a helper
+that does not answer behind; the mount is remembered in
+`/var/lib/watchfor-agent/hung-mounts` and not asked again while that
+helper is stuck. With the systemd service installed as well, the cron run
+steps aside — but keep one of the two; `health` points it out.
+
+What the server asked for outlives the run: a `Retry-After`, the backoff
+after a rejected token or while the server fails, and a plan pause are
+kept in `/var/lib/watchfor-agent/pause-state`, so the next minute's run
+waits (its batch goes to the spool) instead of asking again; such a run
+exits 0. At the default `log.level: info` a run that went well prints
+nothing; warnings and errors still do. The cron file sets `MAILTO=""`, so
+cron does not mail them every minute — `sudo watchfor-agent health` shows
+the last push's answer.
 
 ```sh
 sudo cp packaging/watchfor-agent.cron /etc/cron.d/watchfor-agent
 ```
 
 ```cron
+MAILTO=""
 * * * * * watchfor-agent /usr/local/bin/watchfor-agent once -config /etc/watchfor-agent/agent.yml
 ```
 
@@ -184,6 +203,12 @@ state directory, the config directory (the token file is overwritten before
 it is deleted), the `watchfor-agent` system user and the binary. Only
 directories called `watchfor-agent` are removed recursively: a `spool.dir`
 under another name is reported and left to you.
+
+With `-keep-config` the kept folder, token included, is handed to root:
+the account it belonged to is deleted, and its uid may go to the next
+account created on the machine, which would then own the token. Running
+the installer again creates the account and gives the token back to it
+(and checks that the service then stays up).
 
 Remove the host in the dashboard as well; that revokes the token and deletes
 its history.
@@ -305,7 +330,10 @@ Long lists — mounts, interfaces, processes — filter as you type after
 `/`.
 
 **Health check** answers, without a shell, what someone would otherwise
-check by hand: is `agent.yml` there and does it parse, is the binary
+check by hand: is `agent.yml` there and does it parse, is it (or its
+folder) writable by anyone but root or owned by another account — a
+failure, since whoever can change it can point `server.url` at their own
+server and receive the token —, is the binary
 writable by others, does the service user exist and does anything else
 run with its uid, is the token file private, is the spool writable, is
 the service running and enabled (and its unit this release's), do the
@@ -313,10 +341,16 @@ service and a cron entry both run the agent, is the update timer what the
 config says, can the host reach WatchFor over TLS (with `server.ca_file`
 when set, as the agent does), and does WatchFor accept this host — the
 last push's answer: accepted, token rejected, paused by the plan, or no
-answer. Each answer that can be repaired safely says how, and *Repair
+answer. A rejected-token record in the state folder is shown with what it
+says; one that no longer counts — for an earlier token, written for a plan
+pause, older than the token file, or left by an agent before 0.9 (which
+counted a plan pause as a dead token and stopped for good) — comes with a
+repair that removes it and starts the service if it had stopped over it.
+Each answer that can be repaired safely says how, and *Repair
 what can be repaired* applies all of them (chmod, chown, mkdir,
 `systemctl enable --now`, moving the account to a free uid, removing the
-duplicate cron entry, installing this release's unit). After the agent
+duplicate cron entry, installing this release's unit, removing a stale
+rejected-token record). After the agent
 stopped itself over a rejected token (exit 3) it offers no "start again"
 until the token has changed.
 
@@ -492,9 +526,15 @@ Rules that hold for the whole file:
 - The token belongs in a file that must be mode 0600, or in an
   environment variable (`token: env:NAME`). A literal `token:` in
   agent.yml is accepted but the health check warns about it, and the
-  screen never shows it back. The token comes from a file that must be mode
-  0600, or from an environment variable. A world-readable token file is a
-  start-up error.
+  screen never shows it back. A world-readable token file is a start-up
+  error, and so is one that holds more than one line, characters no HTTP
+  header may carry, or is not a plain file (a FIFO or device is refused at
+  once instead of blocking; a symlink to a plain file is fine).
+- `run` and `once` refuse an `agent.yml` that others may write (group- or
+  world-writable), and a folder around it or around the token file that
+  others may write (unless it has the sticky bit, like `/tmp`): anyone who
+  can change the file can point `server.url` at their own server and
+  receive the token. `check` sends nothing and still runs.
 - `server.url` must be `https://` (plain `http://` is allowed for
   `localhost` only). `ca_file` pins a CA instead of the system store.
 - `interval` has a floor of 5 seconds. The server answers each batch with the
@@ -572,12 +612,22 @@ Exit status 3 means the server has rejected the token repeatedly for over
 an hour (one rejection is spooled and retried with a growing backoff);
 the unit does not
 restart on it, because restarting would only repeat the rejection. A
-start by hand (or a boot) always tries once more, and a new token in
-`/etc/watchfor-agent/token` is picked up by a running agent within 30
-seconds. A host WatchFor has paused because the plan does not take it
-(over the host limit) is not a dead token: the agent asks again after 1,
-5, 15 and then every 30 minutes, keeps nothing meanwhile, and resumes by
-itself when the plan allows.
+start by hand (or a boot) always tries once more, `upgrade` starts a
+service that had stopped this way so the new release can look again, and
+a new token in `/etc/watchfor-agent/token` is picked up by a running agent
+within 30 seconds. A host WatchFor has paused because the plan does not
+take it (over the host limit) is not a dead token: the agent asks again
+after 1, 5, 15 and then every 30 minutes, keeps nothing meanwhile, and
+resumes by itself when the plan allows.
+
+The record behind exit 3 is `/var/lib/watchfor-agent/token-rejected`; it
+now keeps the server's reason. Agents up to 0.8 counted a plan pause in it
+too and stopped for good: this release removes a record written for a plan
+pause or older than the token file at start, and treats a record without a
+reason (0.8's) as unconfirmed — one more rejection is needed before it
+stops. A host 0.8 stopped that way starts again with the new release on
+`sudo systemctl restart watchfor-agent`, a re-run of the installer or a
+reboot (`health` offers the repair).
 
 Two guards keep the service from wedging. Only one agent runs per state
 folder: a second `run` (a manual one next to the service) waits up to 90
@@ -593,9 +643,22 @@ binary.
 ## When the server is unreachable
 
 Batches are written to `/var/lib/watchfor-agent` (up to `spool.max_mb`,
-oldest dropped first) and replayed after the next successful push, at most
-four per push. `once` uses the same directory, so a cron-driven host
-catches up on its next run. While the server keeps failing (network, 429,
+oldest dropped first — also when the disk is full, so the newest batches
+are kept) and replayed after the next successful push. Each replay request
+merges consecutive spooled batches up to 5000 samples, and a push makes as
+many replay requests as the server's per-host budget leaves (four at a
+one-minute interval), so a day offline at one batch a minute is sent in a
+few minutes, not hours. Spool files are numbered in sequence, not by the
+clock, so a clock stepped backwards neither drops the newest batch nor
+replays out of order. `once` uses the same directory, so a cron-driven
+host catches up on its next run.
+
+A batch never goes over ingest's per-request limits (10 000 samples,
+512 KiB compressed): a host with a thousand interfaces sends its batch in
+several requests of at most 5000 samples, and a `413` answer halves the
+request and sends the halves instead of dropping it. A redirect (`3xx`) is
+never followed — the token goes only where `agent.yml` says — but the batch
+is spooled and the log says where it pointed. While the server keeps failing (network, 429,
 5xx) the daemon asks less often: from the second failure in a row it
 waits the interval doubled per failure, up to five minutes, jittered so
 hosts that lost the server together do not return together; a
