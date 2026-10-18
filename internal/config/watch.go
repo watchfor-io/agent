@@ -80,3 +80,31 @@ func statAndSum(path string) (fileState, []byte) {
 	sum := sha256.Sum256(data)
 	return fileState{size: st.Size(), mtime: st.ModTime(), data: data}, sum[:]
 }
+
+// WatchToken blocks until ctx ends (nil) or the token file at path holds
+// a different, non-empty token (ErrReload): re-running the installer with
+// a rotated token, or pasting one by hand, then takes effect within
+// WatchInterval instead of after the old token has been rejected for two
+// hours. A file emptied or removed mid-edit is no change.
+func WatchToken(ctx context.Context, path string) error {
+	last, lastSum := statAndSum(path)
+	t := time.NewTicker(WatchInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			st, err := os.Stat(path)
+			if err != nil || (st.Size() == last.size && st.ModTime().Equal(last.mtime)) {
+				continue
+			}
+			cur, sum := statAndSum(path)
+			last = cur
+			if sum == nil || bytes.Equal(sum, lastSum) || len(bytes.TrimSpace(cur.data)) == 0 {
+				continue
+			}
+			return ErrReload
+		}
+	}
+}

@@ -32,6 +32,10 @@
 #
 set -eu
 
+# Everything runs from main, called on the very last line: a download cut
+# short (curl | sh) defines a function that is never called, instead of
+# running half a script.
+main() {
 REPO="${WATCHFOR_AGENT_REPO:-watchfor-io/agent}"
 # Where the release files (tarball, signature) are downloaded from — GitHub,
 # storage only; a mirror works too, the checks below do not trust it.
@@ -354,6 +358,22 @@ ask() {
     *) return 1 ;;
   esac
 }
+# pick_uid prints the first uid in 60578–61183 that no account, no group
+# and no running process has (empty when there is none). systemd documents
+# that band as unused: above UID_MAX (60000), so not a person; below its
+# DynamicUser range (61184+) and the 100000+ of subuid ranges. Container
+# images take 999, 998, 100–110, 1000, 1001, 65532/65534 — and a container
+# without a user namespace runs them as the same numbers on the host, so
+# `useradd --system` counting down from 999 here can hand the agent the
+# uid of a container's service. Same rule as `watchfor-agent health`.
+pick_uid() {
+  {
+    { getent passwd 2>/dev/null || cat /etc/passwd; } | cut -d: -f3
+    { getent group 2>/dev/null || cat /etc/group; } | cut -d: -f3
+    cat /proc/[0-9]*/status 2>/dev/null | awk '/^Uid:/ { print $2; print $3; print $4; print $5 }'
+  } | awk -v lo=60578 -v hi=61183 '{ t[$1] = 1 } END { for (i = lo; i <= hi; i++) if (!(i in t)) { print i; exit } }'
+}
+
 # interactive: a terminal to ask on (and no --yes).
 interactive() { [ "$ASSUME_YES" != 1 ] && ( : < /dev/tty ) 2>/dev/null; }
 
@@ -410,10 +430,21 @@ if [ "$UNINSTALL" = 1 ]; then
       [ -f "$ETC/token" ] && dd if=/dev/zero of="$ETC/token" bs=1 count="$(wc -c < "$ETC/token")" conv=notrunc 2>/dev/null
       rm -rf "$ETC" && note "  removed $ETC (token overwritten first)"
     fi
-    if id -u watchfor-agent >/dev/null 2>&1; then userdel watchfor-agent 2>/dev/null && note "  removed system user watchfor-agent"; fi
+    if id -u watchfor-agent >/dev/null 2>&1; then
+      # never userdel -f: a process still running as the account may not be
+      # the agent (a container sharing the uid); say so and keep it
+      if out=$(userdel watchfor-agent 2>&1); then
+        note "  removed system user watchfor-agent"
+      else
+        problem "kept system user watchfor-agent: $out"
+        note "  see what still runs as it: ps -o pid,user,comm -u watchfor-agent"
+        USERDEL_FAILED=1
+      fi
+    fi
     # a kept config must not belong to a uid that no longer exists
     [ "$KEEP_CONFIG" = 0 ] || [ ! -d "$ETC" ] || chown -R root:root "$ETC" 2>/dev/null || true
     if [ -e "$BIN" ]; then rm -f "$BIN" && note "  removed $BIN"; fi
+    [ "${USERDEL_FAILED:-0}" = 0 ] || fail "removed watchfor-agent, except its system user"
     ok "removed watchfor-agent${CURRENT:+ $CURRENT}"
   fi
   printf '\n'
@@ -487,12 +518,14 @@ fi
 # ── The release ──────────────────────────────────────────────────────────
 if [ "$VERSION" = "latest" ]; then
   # watchfor.io names the newest release it has verified.
-  step "looking up the latest release" sh -c '$CURL -fsSL --connect-timeout 15 --max-time 30 "$1/latest" | tr -d "[:space:]" > "$2" && grep -q "^v[0-9]" "$2"' sh "$RELEASES" "$TMP/tag" \
+  step "looking up the latest release" sh -c '$CURL -fsSL --connect-timeout 15 --max-time 30 "$1/latest" | tr -d "[:space:]" > "$2" && grep -Eqx "v[0-9]+\.[0-9]+\.[0-9]+" "$2"' sh "$RELEASES" "$TMP/tag" \
     || failstep "could not resolve the latest release from $RELEASES/latest"
   VERSION=$(cat "$TMP/tag")
 fi
 TAG="$VERSION"
 VER="${VERSION#v}"
+# The version ends up in URLs and file names: digits and dots only.
+printf '%s\n' "$VER" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || fail "not a release version: $VERSION (want x.y.z)"
 case "$VER" in
   0.[0-6].*) fail "this installer needs watchfor-agent 0.7.0 or newer (asked for $VER): older releases carry their own install.sh on the release page" ;;
 esac
@@ -576,16 +609,32 @@ if [ "$CURRENT" != "$VER" ] || [ "$REINSTALL" = 1 ]; then
 fi
 
 # ── User, directories, token, config ─────────────────────────────────────
+# A new account gets a uid nothing else uses (pick_uid); an existing one
+# keeps its uid — `watchfor-agent health` says when it is shared and can
+# move it.
+SVC_ID=""
+id -u watchfor-agent >/dev/null 2>&1 || SVC_ID=$(pick_uid)
 step "creating the service user and directories" sh -c '
-  id -u watchfor-agent >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --user-group watchfor-agent
+  if ! id -u watchfor-agent >/dev/null 2>&1; then
+    if [ -n "$3" ]; then
+      getent group watchfor-agent >/dev/null 2>&1 || grep -q "^watchfor-agent:" /etc/group \
+        || groupadd --system --gid "$3" watchfor-agent
+      useradd --system --uid "$3" --gid watchfor-agent --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin watchfor-agent
+    else
+      useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --user-group watchfor-agent
+    fi
+  fi
   install -d -m 0750 -o root -g watchfor-agent "$1"
-  install -d -m 0700 -o watchfor-agent -g watchfor-agent "$2"' sh "$ETC" "$LIB" \
+  install -d -m 0700 -o watchfor-agent -g watchfor-agent "$2"' sh "$ETC" "$LIB" "$SVC_ID" \
   || failstep "could not create the watchfor-agent user or its directories"
-ok "service user watchfor-agent, $ETC, $LIB"
+ok "service user watchfor-agent (uid $(id -u watchfor-agent)), $ETC, $LIB"
 
+TOKEN_CHANGED=0
 if [ -n "$TOKEN" ]; then
+  old_sum=$(sha256sum "$ETC/token" 2>/dev/null | cut -c1-64 || true)
   umask 077
   printf '%s\n' "$TOKEN" > "$ETC/token"
+  [ "$old_sum" = "$(sha256sum "$ETC/token" | cut -c1-64)" ] || TOKEN_CHANGED=1
   chown watchfor-agent:watchfor-agent "$ETC/token"; chmod 0600 "$ETC/token"
   umask 022
   ok "token written to $ETC/token ${C_DIM}(mode 0600)$C_OFF"
@@ -620,8 +669,15 @@ step "installing the systemd service" sh -c '
   [ -f "$unit" ] || { echo "no unit file: $unit" >&2; exit 1; }
   systemctl daemon-reload
   systemctl enable -q --now watchfor-agent
-  [ -z "$2" ] || [ "$2" = "$3" ] || systemctl try-restart watchfor-agent' sh "$TMP" "$CURRENT" "$VER" \
+  # a new version, or a rotated token, needs the running agent restarted
+  if { [ -n "$2" ] && [ "$2" != "$3" ]; } || [ "$4" = 1 ]; then systemctl try-restart watchfor-agent; fi' sh "$TMP" "$CURRENT" "$VER" "$TOKEN_CHANGED" \
   || failstep "could not enable the systemd service"
+# The service and a cron entry both would run the agent twice over (the
+# second steps aside, but starts every minute for nothing).
+if [ -f /etc/cron.d/watchfor-agent ]; then
+  rm -f /etc/cron.d/watchfor-agent && ok "removed /etc/cron.d/watchfor-agent ${C_DIM}(the service runs the agent now)$C_OFF"
+fi
+[ "$TOKEN_CHANGED" != 1 ] || [ -z "$CURRENT" ] || ok "new token in place; the agent restarted on it"
 # Auto-update: the agent owns the timer and the updates.auto line in agent.yml.
 case "$AUTO_UPDATE" in
   1|0)
@@ -662,3 +718,6 @@ line "status" "systemctl status watchfor-agent"
 line "logs" "journalctl -u watchfor-agent -f"
 [ -n "$TOKEN" ] || [ -s "$ETC/token" ] || line "token" "missing: $ETC/token (chmod 600), then restart"
 printf '%s%s%s%s%s\n\n' "$C_DIM" "$B_BL" "$(rule $((W + 16)))" "$B_BR" "$C_OFF"
+}
+
+main "$@"

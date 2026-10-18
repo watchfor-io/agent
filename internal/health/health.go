@@ -10,6 +10,7 @@ package health
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -74,6 +75,8 @@ const ServiceUser = "watchfor-agent"
 // can prepare.
 type Layout struct {
 	Config, Token, Spool, Binary string
+	// Cron is the cron entry a repair may remove when the service runs too.
+	Cron string
 }
 
 // Installed is the layout install.sh creates.
@@ -82,6 +85,7 @@ var Installed = Layout{ // #nosec G101 -- paths, not credentials
 	Token:  "/etc/watchfor-agent/token",
 	Spool:  "/var/lib/watchfor-agent",
 	Binary: "/usr/local/bin/watchfor-agent",
+	Cron:   update.CronPath,
 }
 
 // standard says whether path is exactly the installer's — compared as a
@@ -117,22 +121,49 @@ type Options struct {
 	// stand-in. Nil means the real thing.
 	Dial          func(ctx context.Context, network, addr string) error // a TLS connection to the server, closed at once
 	LookupUser    func(name string) (*user.User, error)
+	LookupGroup   func(name string) (*user.Group, error)
 	HaveSystemctl func() bool
 	UnitFile      string // the service unit; default under update.UnitDir
+
+	// For the uid checks: the uids of all running processes, the
+	// processes running as one uid (with their containers), the accounts
+	// in /etc/passwd with a uid, and whether an id is any account's uid or
+	// any group's gid.
+	ProcUIDs        func() (map[int]bool, error)
+	ProcsOf         func(uid int) ([]Proc, error)
+	AccountsWithUID func(uid int) []string
+	IDTaken         func(id int) bool
 }
 
 // Run performs every check, in the order a person would.
 func Run(ctx context.Context, o Options) []Check {
 	if o.Exec == nil {
-		o.Exec = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			return exec.CommandContext(ctx, name, args...).CombinedOutput()
-		}
+		o.Exec = update.Command
 	}
 	if o.Dial == nil {
-		o.Dial = tlsDial
+		var caFile string
+		if o.Config != nil {
+			caFile = o.Config.Server.CAFile
+		}
+		o.Dial = func(ctx context.Context, network, addr string) error { return tlsDial(ctx, network, addr, caFile) }
 	}
 	if o.LookupUser == nil {
 		o.LookupUser = user.Lookup
+	}
+	if o.LookupGroup == nil {
+		o.LookupGroup = user.LookupGroup
+	}
+	if o.ProcUIDs == nil {
+		o.ProcUIDs = readProcUIDs
+	}
+	if o.ProcsOf == nil {
+		o.ProcsOf = readProcsOf
+	}
+	if o.AccountsWithUID == nil {
+		o.AccountsWithUID = passwdNames
+	}
+	if o.IDTaken == nil {
+		o.IDTaken = idTaken
 	}
 	if o.HaveSystemctl == nil {
 		o.HaveSystemctl = func() bool { _, err := exec.LookPath("systemctl"); return err == nil }
@@ -146,7 +177,7 @@ func Run(ctx context.Context, o Options) []Check {
 	skip := func(name string) Check {
 		return Check{Name: name, State: Skipped, Detail: "no config to check against"}
 	}
-	out := []Check{configFile(o), binary(o), serviceUser(o)}
+	out := []Check{configFile(o), binary(o), serviceUser(o), uidShare(o)}
 	if o.Config != nil {
 		out = append(out, tokenFile(o), spoolDir(o))
 	} else {
@@ -155,11 +186,15 @@ func Run(ctx context.Context, o Options) []Check {
 	if o.Deep {
 		out = append(out, releaseBinary(ctx, o))
 	}
-	out = append(out, unit(ctx, o), timer(ctx, o))
+	out = append(out, unit(ctx, o))
+	if c, ok := schedule(ctx, o); ok {
+		out = append(out, c)
+	}
+	out = append(out, timer(ctx, o))
 	if o.Config != nil {
-		out = append(out, reachable(ctx, o))
+		out = append(out, reachable(ctx, o), accepted(o))
 	} else {
-		out = append(out, skip("WatchFor reachable"))
+		out = append(out, skip("WatchFor reachable"), skip("WatchFor accepts this host"))
 	}
 	return out
 }
@@ -277,16 +312,36 @@ func serviceUser(o Options) Check {
 	if err != nil {
 		c.State, c.Detail = Warn, "no "+ServiceUser+" account — fine for a cron install"
 		if o.Root {
-			c.FixMsg = "create the system user"
-			c.Fix = func(ctx context.Context) error {
-				_, err := o.Exec(ctx, "useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", "--user-group", ServiceUser)
-				return err
-			}
+			c.FixMsg = fmt.Sprintf("create the system user, with a uid from %d–%d that nothing else uses", QuietUIDMin, QuietUIDMax)
+			c.Fix = func(ctx context.Context) error { return createAccount(ctx, o) }
 		}
 		return c
 	}
 	c.State, c.Detail = OK, fmt.Sprintf("%s (uid %s)", u.Username, u.Uid)
 	return c
+}
+
+// createAccount makes the service account in the quiet band (see
+// QuietUIDMin), group and user with the same id.
+func createAccount(ctx context.Context, o Options) error {
+	inUse, err := o.ProcUIDs()
+	if err != nil {
+		return err
+	}
+	id, ok := PickUID(inUse, o.IDTaken)
+	if !ok {
+		return fmt.Errorf("no free uid left in %d–%d", QuietUIDMin, QuietUIDMax)
+	}
+	if _, err := o.LookupGroup(ServiceUser); err != nil {
+		if out, err := o.Exec(ctx, "groupadd", "--system", "--gid", strconv.Itoa(id), ServiceUser); err != nil {
+			return fmt.Errorf("groupadd: %w: %s", err, trimBytes(out))
+		}
+	}
+	if out, err := o.Exec(ctx, "useradd", "--system", "--uid", strconv.Itoa(id), "--gid", ServiceUser,
+		"--no-create-home", "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin", ServiceUser); err != nil {
+		return fmt.Errorf("useradd: %w: %s", err, trimBytes(out))
+	}
+	return nil
 }
 
 func tokenFile(o Options) Check {
@@ -394,7 +449,34 @@ func unit(ctx context.Context, o Options) Check {
 	}
 	active := trim(o.Exec(ctx, "systemctl", "is-active", "watchfor-agent"))
 	enabled := trim(o.Exec(ctx, "systemctl", "is-enabled", "watchfor-agent"))
+	if active != "active" && trim(o.Exec(ctx, "systemctl", "show", "-p", "ExecMainStatus", "--value", "watchfor-agent")) == "3" {
+		// Exit 3: the agent stopped itself over a rejected token, and systemd
+		// does not restart it (RestartPreventExitStatus). Starting it again
+		// with the same token only repeats that; a new token is the fix.
+		c.State = Fail
+		c.Detail = "stopped by itself: WatchFor rejected the host token (exit 3) — paste the new token in Settings → Server (or " + o.Layout.Token + "), then start it"
+		if o.Config != nil {
+			if _, sticky := rejection(o); !sticky {
+				c.Detail = "stopped after WatchFor rejected the host token (exit 3); the token has changed since"
+				c.FixMsg = "start it on the new token"
+				c.Fix = fixCmd(o, "systemctl", "restart", "watchfor-agent")
+			}
+		}
+		return c
+	}
+	drift := unitDrift(o)
 	switch {
+	case active == "active" && enabled == "enabled" && drift != "":
+		c.State, c.Detail = Warn, "running and enabled at boot · "+drift
+		if strings.Contains(drift, "earlier release") && o.Root {
+			c.FixMsg = "install this release's unit and restart the service"
+			c.Fix = func(ctx context.Context) error {
+				if _, _, err := update.SyncUnits(ctx, filepath.Dir(o.UnitFile), o.Layout.Cron, update.Exec(o.Exec)); err != nil {
+					return err
+				}
+				return fixCmd(o, "systemctl", "restart", "watchfor-agent")(ctx)
+			}
+		}
 	case active == "active" && enabled == "enabled":
 		c.State, c.Detail = OK, "running and enabled at boot"
 	case active == "active":
@@ -414,6 +496,22 @@ func unit(ctx context.Context, o Options) Check {
 		c.Fix = fixCmd(o, "systemctl", "enable", "--now", "watchfor-agent")
 	}
 	return c
+}
+
+// unitDrift says how the installed unit differs from this release's: ""
+// when it is the same (or cannot be read).
+func unitDrift(o Options) string {
+	st, err := update.CompareFile(o.UnitFile, update.ServiceUnit)
+	if err != nil {
+		return ""
+	}
+	switch st {
+	case update.FileOutdated:
+		return "the unit is an earlier release's (upgrade replaced the binary only)"
+	case update.FileModified:
+		return "the unit was edited locally, so upgrades leave it alone — changes belong in a drop-in (systemctl edit watchfor-agent)"
+	}
+	return ""
 }
 
 func timer(ctx context.Context, o Options) Check {
@@ -487,8 +585,23 @@ func fixCmd(o Options, name string, args ...string) func(context.Context) error 
 
 // tlsDial opens and closes one TLS connection: proof that the host is
 // there, the port is open and a certificate is served.
-func tlsDial(ctx context.Context, network, addr string) error {
-	dialer := tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: &tls.Config{MinVersion: tls.VersionTLS12}}
+// With ca_file set, the agent trusts only that CA, and so does this check:
+// a private ingest whose certificate the system roots do not know is
+// reachable, and one the agent would refuse is not.
+func tlsDial(ctx context.Context, network, addr, caFile string) error {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return fmt.Errorf("ca_file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return fmt.Errorf("ca_file: no certificates in %s", caFile)
+		}
+		cfg.RootCAs = pool
+	}
+	dialer := tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: cfg}
 	conn, err := dialer.DialContext(ctx, network, addr)
 	if err != nil {
 		return err

@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math/rand/v2"
+	"sync/atomic"
 	"time"
 
 	"github.com/watchfor-io/agent/internal/metric"
@@ -47,6 +49,13 @@ type Options struct {
 const (
 	factsEvery    = time.Hour
 	replayPerTick = 4 // a burst after an outage must stay under the server's per-host budget
+	// backoffCap is the longest the agent waits between attempts while
+	// the server keeps failing; the spool holds the batches meanwhile.
+	backoffCap = 5 * time.Minute
+	// stallGrace is what a round may take beyond two intervals before it
+	// counts as stuck: every module's budget, a push and a replay burst at
+	// their timeouts fit well inside it.
+	stallGrace = 10 * time.Minute
 )
 
 // Agent is one host's collect → encode → send loop, plus the state the
@@ -70,12 +79,42 @@ type Agent struct {
 	// dropNoted is the last dropped count the log was told about, and when.
 	dropNoted   int
 	dropNotedAt time.Time
+
+	// failures counts transient send failures in a row; from the second
+	// one on, the agent waits an exponentially longer, jittered time
+	// before asking again, so thousands of hosts do not hit a recovering
+	// server in lockstep every tick.
+	failures int
+	jitter   func(time.Duration) time.Duration
+
+	// roundStart is when the round in progress began (unix ns, 0 when
+	// idle) and roundLimit how long it may take; both are read by the
+	// stall guard on another goroutine.
+	roundStart atomic.Int64
+	roundLimit atomic.Int64
+
+	// pushState is the last answer recorded in PushStateFile.
+	pushState string
+	// planPauses counts plan_forbidden answers in a row, for their
+	// backoff; pauseDrop says the pause in force is one where batches are
+	// not kept (the plan does not take them).
+	planPauses int
+	pauseDrop  bool
+	// lastSent is whether the last batch sent was accepted, for Once.
+	lastSent bool
+
+	self selfUsage // the agent's own CPU time at the last tick
 }
 
 // ErrTokenRejected is returned by Run/Once once the server has rejected
 // the token repeatedly over a span of time: the host was removed in
 // WatchFor or its token was rotated, and the agent should stop.
 var ErrTokenRejected = errors.New("token rejected by the server repeatedly")
+
+// ErrNotAccepted is Once's answer when the batch did not get through: the
+// server was unreachable or refused it. The batch is in the spool when
+// there is one; the exit status tells cron (and whoever reads its mail).
+var ErrNotAccepted = errors.New("the batch was not accepted by the server")
 
 // New prepares an Agent from o, filling in slog's default logger and the
 // real clock when they are left nil.
@@ -86,7 +125,31 @@ func New(o Options) *Agent {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	return &Agent{o: o, interval: o.Interval, failing: map[string]string{}}
+	a := &Agent{o: o, interval: o.Interval, failing: map[string]string{}}
+	a.jitter = func(d time.Duration) time.Duration { return d/2 + rand.N(d/2+1) } // #nosec G404 -- spreading retries, not a secret
+	a.roundLimit.Store(int64(2*o.Interval + stallGrace))
+	return a
+}
+
+// Stalled reports a round that has been running longer than it possibly
+// can when it is making progress — a module stuck in a syscall on a dead
+// NFS mount, a deadlock — and for how long. The daemon's stall guard exits
+// on it so the service manager starts a fresh agent instead of leaving a
+// process that looks alive and sends nothing.
+func (a *Agent) Stalled(now time.Time) (time.Duration, bool) {
+	start := a.roundStart.Load()
+	if start == 0 {
+		return 0, false
+	}
+	running := now.Sub(time.Unix(0, start))
+	return running, running > time.Duration(a.roundLimit.Load())
+}
+
+// round brackets one collect-and-send for Stalled.
+func (a *Agent) round() func() {
+	a.roundLimit.Store(int64(2*a.interval + stallGrace))
+	a.roundStart.Store(a.o.Now().UnixNano())
+	return func() { a.roundStart.Store(0) }
 }
 
 // Interval is the cadence currently in use.
@@ -141,16 +204,25 @@ func (a *Agent) applyAck(ack push.Ack) {
 // collects again and sends only the second batch. The priming pass never
 // becomes a payload, so the one batch that is sent carries the facts.
 func (a *Agent) Once(ctx context.Context, gap time.Duration) error {
+	defer a.round()()
 	a.collect(ctx)
+	a.footprint(nil)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(gap):
 	}
-	return a.send(ctx, a.Collect(ctx))
+	if err := a.send(ctx, a.Collect(ctx)); err != nil {
+		return err
+	}
+	if !a.lastSent {
+		return ErrNotAccepted
+	}
+	return nil
 }
 
 func (a *Agent) tick(ctx context.Context) error {
+	defer a.round()()
 	err := a.send(ctx, a.Collect(ctx))
 	if errors.Is(err, ErrTokenRejected) {
 		return err
@@ -189,6 +261,7 @@ func (a *Agent) rejected(err error, body []byte) error {
 // Collect runs every module once and wraps the samples as a payload.
 func (a *Agent) Collect(ctx context.Context) *metric.Payload {
 	b := a.collect(ctx)
+	a.footprint(b)
 	p := &metric.Payload{
 		Version: metric.PayloadVersion,
 		Agent:   a.o.Version,
@@ -239,38 +312,60 @@ func (a *Agent) send(ctx context.Context, p *metric.Payload) error {
 	if err != nil {
 		return err
 	}
+	a.lastSent = false
 	if now := a.o.Now(); now.Before(a.pauseUntil) {
-		// Waiting out a token rejection or a Retry-After: keep the batch,
-		// do not ask yet.
-		if a.o.Spool != nil {
+		// Waiting out a token rejection, a Retry-After or a backoff: keep
+		// the batch, do not ask yet. A plan pause keeps nothing.
+		if a.o.Spool != nil && !a.pauseDrop {
 			_ = a.o.Spool.Put(body)
 		}
 		return nil
 	}
+	a.pauseDrop = false
 	ack, err := a.o.Sink.Send(ctx, body)
 	if err != nil {
 		switch {
 		case errors.Is(err, push.ErrUnauthorized):
+			a.notePush(PushTokenRejected)
 			return a.rejected(err, body)
-		case push.Retryable(err) && a.o.Spool != nil:
+		case errors.Is(err, push.ErrPlanPaused):
+			a.planPaused(err)
+		case push.Retryable(err):
 			if wait := push.RetryAfter(err); wait > 0 {
 				a.pauseUntil = a.o.Now().Add(wait) // the server said when; the spool holds the meantime
 				a.o.Log.Debug("server asked for a pause", "wait", wait)
 			}
-			if serr := a.o.Spool.Put(body); serr != nil {
-				a.o.Log.Error("send failed and spool refused the batch", "error", err, "spool", serr)
-			} else {
-				if ctx.Err() != nil { // shutdown or reload, not the server
+			if ctx.Err() != nil { // shutdown or reload, not the server
+				if a.o.Spool != nil && a.o.Spool.Put(body) == nil {
 					a.o.Log.Debug("send cut short, batch spooled", "samples", len(p.Samples))
+				}
+				return nil
+			}
+			a.backoff()
+			a.notePush(PushNoAnswer)
+			switch {
+			case a.o.Spool == nil:
+				a.o.Log.Warn("send failed; no spool, batch dropped", "error", err, "samples", len(p.Samples))
+			default:
+				if serr := a.o.Spool.Put(body); serr != nil {
+					a.o.Log.Error("send failed and spool refused the batch", "error", err, "spool", serr)
 				} else {
 					a.o.Log.Warn("send failed, batch spooled", "error", err, "samples", len(p.Samples))
 				}
 			}
 		default:
+			a.notePush(PushRefused)
 			a.o.Log.Error("batch dropped", "error", err, "samples", len(p.Samples))
 		}
 		return nil
 	}
+	a.lastSent = true
+	a.failures = 0
+	if a.planPauses > 0 {
+		a.planPauses = 0
+		a.o.Log.Info("WatchFor takes this host's batches again")
+	}
+	a.notePush(PushAccepted)
 	a.o.Log.Debug("batch accepted", "samples", len(p.Samples), "bytes", len(body), "facts", p.Facts != nil, "latest_version", ack.LatestVersion)
 	a.noteDropped(ack, len(p.Samples))
 	a.applyAck(ack)
@@ -281,6 +376,58 @@ func (a *Agent) send(ctx context.Context, p *metric.Payload) error {
 	}
 	a.replay(ctx)
 	return nil
+}
+
+// backoff counts a transient failure and, from the second in a row,
+// pauses sending: the interval doubled per failure, capped at backoffCap,
+// jittered down to half so the hosts that lost the server together do
+// not come back together. A longer Retry-After the server sent stands.
+func (a *Agent) backoff() {
+	a.failures++
+	if a.failures < 2 || a.interval <= 0 {
+		return
+	}
+	wait := backoffCap
+	if shift := a.failures - 2; shift < 16 {
+		wait = min(a.interval<<shift, backoffCap)
+	}
+	wait = a.jitter(wait)
+	if until := a.o.Now().Add(wait); until.After(a.pauseUntil) {
+		a.pauseUntil = until
+		a.o.Log.Debug("server unavailable; backing off", "failures", a.failures, "wait", wait.String())
+	}
+}
+
+// planPaused handles ingest's plan_forbidden: the token is valid (so any
+// rejected-token record is stale), the plan does not take this host now.
+// WatchFor restores paused hosts by itself when the limit allows, so the
+// agent never gives up: it asks again after 1, 5, 15, then every 30
+// minutes, jittered, and drops the batches meanwhile — a plan that does
+// not take the host would not take its backlog either.
+func (a *Agent) planPaused(err error) {
+	a.planPauses++
+	if a.planPauses == 1 {
+		ClearRejected(a.o.StateDir)
+	}
+	a.notePush(PushPlanPaused)
+	wait := 30 * time.Minute
+	switch a.planPauses {
+	case 1:
+		wait = time.Minute
+	case 2:
+		wait = 5 * time.Minute
+	case 3:
+		wait = 15 * time.Minute
+	}
+	wait = a.jitter(wait)
+	a.pauseUntil, a.pauseDrop = a.o.Now().Add(wait), true
+	log := a.o.Log.Debug
+	if a.planPauses == 1 || a.planPauses%48 == 0 { // once, then about once a day
+		log = a.o.Log.Warn
+	}
+	log("WatchFor paused this host: the plan does not include server monitoring, or the organization is over its host limit",
+		"error", err, "retry_in", wait.Round(time.Second).String(),
+		"fix", "raise the plan or remove another host in WatchFor; the agent picks up by itself, no restart needed")
 }
 
 // noteUpdate acts on the server's "latest release" hint: one warning per
@@ -336,8 +483,8 @@ func (a *Agent) replay(ctx context.Context) {
 			return
 		}
 		if _, err := a.o.Sink.Send(ctx, body); err != nil {
-			if errors.Is(err, push.ErrUnauthorized) {
-				return // the token is the problem, not this batch; tick() decides what happens next
+			if errors.Is(err, push.ErrUnauthorized) || errors.Is(err, push.ErrPlanPaused) {
+				return // the token or the plan is the problem, not this batch; the next tick decides
 			}
 			if !push.Retryable(err) {
 				a.o.Log.Error("spooled batch dropped", "error", err)

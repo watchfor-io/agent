@@ -134,3 +134,24 @@ func (h headerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	return http.DefaultTransport.RoundTrip(r)
 }
+
+// A host paused by the plan is not a dead token: its own error, never
+// ErrUnauthorized, and not retried through the spool either.
+func TestPlanForbiddenIsAPauseNotARejection(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(ReasonHeader, PlanForbidden)
+		http.Error(w, "host paused: over the plan's host limit", http.StatusForbidden)
+	}))
+	defer srv.Close()
+	c, err := New(srv.URL, "wfh_x", "", 5*time.Second, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Send(context.Background(), []byte("{}"))
+	if !errors.Is(err, ErrPlanPaused) || errors.Is(err, ErrUnauthorized) || Retryable(err) {
+		t.Fatalf("plan_forbidden: got %v (unauthorized %v, retryable %v)", err, errors.Is(err, ErrUnauthorized), Retryable(err))
+	}
+	if !strings.Contains(err.Error(), "host limit") {
+		t.Errorf("the server's words are lost: %v", err)
+	}
+}

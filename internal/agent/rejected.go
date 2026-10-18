@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/watchfor-io/agent/internal/safefile"
 )
 
 // RejectedMarker is written next to the spool when the server rejects
@@ -62,7 +64,7 @@ func ReadRejection(dir, fingerprint string) (rec Rejection, ok bool) {
 	if dir == "" || fingerprint == "" {
 		return Rejection{}, false
 	}
-	b, err := os.ReadFile(filepath.Join(dir, RejectedMarker))
+	b, err := safefile.ReadFile(filepath.Join(dir, RejectedMarker), stateCap)
 	if err != nil {
 		return Rejection{}, false
 	}
@@ -94,11 +96,7 @@ func RecordRejection(dir, fingerprint string, at time.Time) (Rejection, error) {
 		return rec, errors.New("no state directory or token")
 	}
 	line := strings.Join([]string{fingerprint, strconv.Itoa(rec.Count), rec.First.UTC().Format(time.RFC3339), rec.Last.UTC().Format(time.RFC3339)}, " ") + "\n"
-	tmp := filepath.Join(dir, "."+RejectedMarker+".tmp")
-	if err := os.WriteFile(tmp, []byte(line), 0o600); err != nil {
-		return rec, err
-	}
-	return rec, os.Rename(tmp, filepath.Join(dir, RejectedMarker))
+	return rec, writeState(dir, RejectedMarker, []byte(line))
 }
 
 // ClearRejected removes the record (a token that works again).

@@ -405,6 +405,34 @@ func TestRunRestartsActiveUnit(t *testing.T) {
 	}
 }
 
+// After the swap, the new binary is asked to sync the units, before the
+// restart that brings them into effect.
+func TestRunSyncsUnitsWithTheNewBinary(t *testing.T) {
+	s := newSigner(t)
+	r := newRelease(t, s, "9.9.9", "#!/bin/sh\necho watchfor-agent 9.9.9\n", nil)
+	o := testOptions(t, r, s, "0.2.0")
+	o.Target, o.Restart, o.SyncUnits = "9.9.9", true, true
+	var calls []string
+	o.Exec = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		switch {
+		case name == "systemctl":
+			calls = append(calls, "systemctl "+args[0])
+			return nil, nil
+		case len(args) > 0 && args[0] == "upgrade":
+			calls = append(calls, filepath.Base(name)+" "+strings.Join(args, " "))
+			return nil, nil
+		}
+		return execScript(ctx, name, args...)
+	}
+	if _, err := Run(context.Background(), o); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Base(o.ExePath) + " upgrade -sync-units;systemctl is-active;systemctl restart"
+	if strings.Join(calls, ";") != want {
+		t.Fatalf("calls = %v, want %s", calls, want)
+	}
+}
+
 // BinaryDigest must name the hash of the binary inside the signed archive,
 // and refuse a checksums file signed by anyone else.
 func TestBinaryDigest(t *testing.T) {
