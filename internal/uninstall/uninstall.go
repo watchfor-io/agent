@@ -242,7 +242,11 @@ func Run(ctx context.Context, o Options) error {
 			_ = run("groupdel", o.User) // already gone when it was the user's private group
 		}
 		if o.KeepConfig && p.ConfigDir != "" {
-			// a kept config must not belong to a uid that no longer exists
+			// A kept config must not belong to a uid that no longer exists:
+			// the next useradd (any service's) may get that uid and with it
+			// the token. Root keeps it instead; install.sh hands the token
+			// back to the service account it creates on a reinstall, and
+			// checks that the service then stays up.
 			// #nosec G122 -- Lchown acts on the link itself, never its target,
 			// so a planted symlink cannot redirect the chown out of the tree.
 			_ = filepath.WalkDir(p.ConfigDir, func(path string, _ os.DirEntry, err error) error {
@@ -251,6 +255,7 @@ func Run(ctx context.Context, o Options) error {
 				}
 				return nil
 			})
+			say("handed %s to root (its account is gone); the installer gives the token back to the new account", p.ConfigDir)
 		}
 	}
 	// The binary last: on Linux an unlinked executable keeps running.

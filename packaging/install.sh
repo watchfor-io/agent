@@ -245,6 +245,48 @@ esac
 # amd64 or arm64. Anything else is told so here, before any other check
 # could produce a confusing "missing: sha256sum useradd".
 problem() { printf '%s%s %s%s\n\n' "$C_RED" "$I_BAD" "$1" "$C_OFF" >&2; }
+
+# own_token hands the token file to the service account, 0600 — only a
+# plain file (never through a symlink) in a directory that root owns and
+# nobody else may write, so nothing can be swapped in between the look and
+# the chown.
+own_token() {
+  _t=$1
+  [ -f "$_t" ] && [ ! -L "$_t" ] || return 0
+  _d=$(dirname "$_t")
+  if [ "$(stat -c %u "$_d" 2>/dev/null)" != 0 ] || [ -n "$(find "$_d" -maxdepth 0 -perm /022 2>/dev/null)" ]; then
+    note "  left $_t as it is: $_d is not a folder only root may change"
+    return 0
+  fi
+  _was=$(stat -c '%U:%G %a' "$_t" 2>/dev/null || echo "?")
+  [ "$_was" != "watchfor-agent:watchfor-agent 600" ] || return 0
+  chown -h watchfor-agent:watchfor-agent "$_t" && chmod 0600 "$_t" \
+    || fail "could not give $_t to watchfor-agent"
+  ok "token file $_t given to watchfor-agent, mode 0600 ${C_DIM}(was $_was)$C_OFF"
+}
+
+# SERVICE_UP waits until the agent's process has been running for three
+# seconds in a row (a restart to pick up a changed agent.yml is fine), for
+# at most 20 seconds. A script, not a function: steps run in their own
+# process group.
+SERVICE_UP='
+pid=""; same=0; i=0
+while [ "$i" -lt 20 ]; do
+  sleep 1
+  i=$((i + 1))
+  st=$(systemctl show -p ActiveState --value watchfor-agent 2>/dev/null)
+  sub=$(systemctl show -p SubState --value watchfor-agent 2>/dev/null)
+  now=$(systemctl show -p MainPID --value watchfor-agent 2>/dev/null)
+  if [ "$st" = active ] && [ "$sub" = running ] && [ -n "$now" ] && [ "$now" != 0 ] && [ "$now" = "$pid" ]; then
+    same=$((same + 1))
+    [ "$same" -lt 3 ] || exit 0
+  else
+    same=0
+  fi
+  pid=$now
+done
+exit 1
+'
 OS=$(uname -s 2>/dev/null || echo unknown)
 case "$OS" in
   Linux) ;;
@@ -442,7 +484,11 @@ if [ "$UNINSTALL" = 1 ]; then
       fi
     fi
     # a kept config must not belong to a uid that no longer exists
-    [ "$KEEP_CONFIG" = 0 ] || [ ! -d "$ETC" ] || chown -R root:root "$ETC" 2>/dev/null || true
+    # (the uid may go to the next account created); a reinstall gives the
+    # token back to the service account (own_token)
+    if [ "$KEEP_CONFIG" = 1 ] && [ -d "$ETC" ] && chown -R root:root "$ETC" 2>/dev/null; then
+      note "  handed $ETC to root; a reinstall gives the token back to the service account"
+    fi
     if [ -e "$BIN" ]; then rm -f "$BIN" && note "  removed $BIN"; fi
     [ "${USERDEL_FAILED:-0}" = 0 ] || fail "removed watchfor-agent, except its system user"
     ok "removed watchfor-agent${CURRENT:+ $CURRENT}"
@@ -649,6 +695,13 @@ if [ ! -f "$ETC/agent.yml" ]; then
 else
   ok "config kept: $ETC/agent.yml"
 fi
+# The token file must be the service account's. One kept from an earlier
+# install is root's: `--uninstall --keep-config` hands what it keeps to root,
+# since the account it belonged to is deleted and its uid may go to the
+# next service created. Left that way, the agent cannot read it and the
+# unit restarts every 5 seconds.
+TOKEN_PATH=$("$BIN" config get -config "$ETC/agent.yml" server.token_file 2>/dev/null || true)
+own_token "${TOKEN_PATH:-$ETC/token}"
 
 # ── auto-update: ask when no flag decided it ─────────────────────────────
 if [ -z "$AUTO_UPDATE" ]; then
@@ -684,6 +737,15 @@ case "$AUTO_UPDATE" in
     if [ "$AUTO_UPDATE" = 1 ]; then _au=on; else _au=off; fi
     step "turning auto-update $_au" "$BIN" auto-update -config "$ETC/agent.yml" "$_au" || failstep "could not turn auto-update $_au" ;;
 esac
+# "running" only once it is: a unit whose agent exits at once (a token it
+# cannot read, an agent.yml it refuses) is "activating (auto-restart)"
+# between attempts, and `systemctl enable --now` succeeds all the same.
+if [ -n "$TOKEN" ] || [ -s "${TOKEN_PATH:-$ETC/token}" ]; then
+  step "checking that the service stays up" sh -c "$SERVICE_UP" \
+    || { problem "watchfor-agent does not stay running — what it said:"
+         journalctl -u watchfor-agent -n 8 --no-pager -o cat 2>/dev/null | sed 's/^/    /' >&2
+         fail "the service is not running: fix the above, then: sudo systemctl restart watchfor-agent (sudo watchfor-agent health helps)"; }
+fi
 if [ -n "$CURRENT" ] && [ "$CURRENT" != "$VER" ]; then
   ok "service restarted on watchfor-agent $VER"
   service_state="watchfor-agent, restarted, runs as user watchfor-agent"
