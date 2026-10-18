@@ -196,3 +196,29 @@ func TestStatAllHonoursContext(t *testing.T) {
 		t.Fatal("want the context's error")
 	}
 }
+
+// `config init` (run by the installer) lists the mounts with the same
+// guard: a hung mount is left out and the listing still finishes.
+func TestDiscoverSkipsAHungMount(t *testing.T) {
+	fakeMounts(t,
+		"/dev/sda1 / ext4 rw 0 0",
+		"srv:/export /nfs nfs4 rw,hard 0 0",
+		"/dev/sdb1 /data xfs rw 0 0",
+	)
+	m, _, _ := newHangTest(t, "/nfs")
+	start := time.Now()
+	mounts, _, err := m.discover()
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("discover took %s with a hung mount", took)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, d := range mounts {
+		got = append(got, d.Point)
+	}
+	if strings.Join(got, ",") != "/,/data" {
+		t.Fatalf("discovered %v, want / and /data without the hung /nfs", got)
+	}
+}
