@@ -38,6 +38,7 @@ import (
 	"github.com/watchfor-io/agent/internal/hostinfo"
 	"github.com/watchfor-io/agent/internal/metric"
 	"github.com/watchfor-io/agent/internal/modules"
+	"github.com/watchfor-io/agent/internal/modules/disk"
 	"github.com/watchfor-io/agent/internal/push"
 	"github.com/watchfor-io/agent/internal/spool"
 )
@@ -83,6 +84,14 @@ func run(args []string) int {
 		return exitUsage
 	}
 	cmd, args := args[0], args[1:]
+	if cmd == disk.HelperArg {
+		return disk.Helper(args) // a statfs helper for a command that must end (see disk.Isolate)
+	}
+	if cmd != "run" {
+		// Every command but the daemon must end on time, even with a dead
+		// hard mount on the machine: statfs goes through helper processes.
+		disk.Isolate(disk.SelfExe())
+	}
 	if strings.HasPrefix(cmd, "-") && cmd != "-version" && cmd != "--version" && cmd != "-h" && cmd != "--help" && cmd != "-help" {
 		// options first: `-config x.yml check` is `check -config x.yml`,
 		// and options alone (`watchfor-agent -config x.yml`) are the screen
@@ -165,6 +174,9 @@ func runCollector(cmd, configPath string) int {
 	log := newLogger(level)
 	facts := hostinfo.Options{Target: cfg.Server.URL, CloudMetadata: cfg.Facts.CloudMetadataEnabled() && cmd != "check", Log: log} // check promises no network
 
+	if cmd != "check" {
+		disk.RememberHungIn(cfg.Spool.Dir) // so a restart or the next cron run does not ask a hung mount again
+	}
 	mods, err := buildModules(cfg)
 	if err != nil {
 		log.Error("modules", "error", err)
