@@ -297,6 +297,8 @@ func lockInstance(ctx context.Context, cmd, dir string, log *slog.Logger) (inst 
 	if dir == "" {
 		return nil, exitOK, true
 	}
+	// the spool would create the folder a moment later; the lock needs it first
+	_ = os.MkdirAll(dir, 0o700)
 	inst, err := agent.Lock(ctx, dir, 0)
 	if errors.Is(err, agent.ErrBusy) && cmd == "run" {
 		log.Info("another watchfor-agent holds the state directory; waiting for it to finish", "lock", filepath.Join(dir, agent.LockFile))
