@@ -46,7 +46,9 @@ modules:
 
   network: {}                             # rates per interface, socket counts
   #   interfaces: [eth0]                  # default: all except `ignore`
-  #   ignore: [lo, "veth*", "docker*", "br-*", "virbr*"]
+  #   ignore: [lo, "veth*", "docker*", "br-*", "virbr*", "vnet*", "cali*", "vxlan.calico",
+  #            "vxlan-v6.calico", "tunl*", "flannel*", "cni*", "kube-ipvs*", "kube-bridge",
+  #            "cilium_*", "lxc*", "weave", "vethwe*", "datapath"]   # the default
 
   processes:                              # state counts, top consumers, watches
     top: 10

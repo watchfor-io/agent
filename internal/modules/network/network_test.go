@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/watchfor-io/agent/internal/metric"
 	"github.com/watchfor-io/agent/internal/procfs"
 	"github.com/watchfor-io/agent/internal/testutil"
@@ -53,5 +55,25 @@ func TestExplicitInterfaces(t *testing.T) {
 	m.Collect(context.Background(), b)
 	if _, ok := testutil.Find(b, "net.rx_bytes_per_s", metric.Labels{"if": "lo"}); !ok {
 		t.Error("explicit interface list should override the ignore defaults")
+	}
+}
+
+// A Kubernetes node has an interface per pod; the default list leaves the
+// CNI plumbing out and keeps the real NICs.
+func TestDefaultIgnoreLeavesOutCNIPlumbing(t *testing.T) {
+	m, err := New(&yaml.Node{Kind: yaml.MappingNode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mod := m.(*module)
+	for _, name := range []string{"lo", "cali1a2b3c4d5e6", "vxlan.calico", "tunl0", "flannel.1", "cni0", "kube-ipvs0", "lxc12ab", "cilium_host", "veth9f", "docker0", "vnet3"} {
+		if mod.want(name) {
+			t.Errorf("%s would be reported", name)
+		}
+	}
+	for _, name := range []string{"eth0", "ens5", "enp3s0", "bond0", "wg0", "tailscale0", "vxlan100"} {
+		if !mod.want(name) {
+			t.Errorf("%s would be left out", name)
+		}
 	}
 }

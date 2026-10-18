@@ -100,8 +100,9 @@ func TestSpoolAndReplay(t *testing.T) {
 	if n, _ := sp.Stats(); n != 0 {
 		t.Errorf("spool not drained: %d left", n)
 	}
-	if len(sink.got) != 3 {
-		t.Errorf("sent %d payloads after recovery, want 3", len(sink.got))
+	// the live batch, then both spooled ones merged into one request
+	if len(sink.got) != 2 || len(sink.got[1].Samples) <= len(sink.got[0].Samples) {
+		t.Errorf("sent %d requests after recovery, want 2 (the live batch, then the spooled two merged)", len(sink.got))
 	}
 }
 

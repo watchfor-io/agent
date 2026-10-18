@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -128,5 +129,136 @@ func TestNextSkipsNonRegularEntries(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(secret); string(b) != "root-only" {
 		t.Error("symlink target was touched")
+	}
+}
+
+// Names follow a sequence, not the clock: the sequence continues from the
+// highest name on disk (a legacy clock-named batch included), so a clock
+// stepped back neither trims the newest batch nor flips the replay order.
+func TestSequenceNamesSurviveClockStepsAndRestarts(t *testing.T) {
+	dir := t.TempDir()
+	// a batch an older release named by the clock, "in the future"
+	legacy := "01792319505957206308-000009.gz"
+	if err := os.WriteFile(filepath.Join(dir, legacy), []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(dir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put([]byte("new-1")); err != nil {
+		t.Fatal(err)
+	}
+	// a new process (cron's next once) continues the sequence
+	s2, err := Open(dir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Put([]byte("new-2")); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for {
+		name, data, err := s2.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name == "" {
+			break
+		}
+		got = append(got, string(data))
+		_ = s2.Remove(name)
+	}
+	if want := "legacy,new-1,new-2"; strings.Join(got, ",") != want {
+		t.Fatalf("replay order %v, want %s", got, want)
+	}
+}
+
+// A full spool trims the oldest batches, never the one just written, and
+// says how many went.
+func TestTrimNeverDropsTheNewBatch(t *testing.T) {
+	dir := t.TempDir()
+	// older batches filling the cap, named so they sort after anything
+	// the clock would give — the sequence still comes after them
+	for i := 0; i < 3; i++ {
+		n := filepath.Join(dir, "0999999999999999999"+string(rune('0'+i))+"-000001.gz")
+		if err := os.WriteFile(n, bytes.Repeat([]byte{'o'}, 10), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := Open(dir, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(bytes.Repeat([]byte{'n'}, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if d := s.TakeDropped(); d != 1 {
+		t.Errorf("dropped %d, want 1", d)
+	}
+	names := s.Oldest(10)
+	last, _ := s.Read(names[len(names)-1])
+	if len(names) != 3 || last[0] != 'n' {
+		t.Fatalf("after the put: %v (newest %q)", names, last)
+	}
+}
+
+// When the disk is full the oldest batches make room for the new one.
+func TestDiskFullDropsOldestFirst(t *testing.T) {
+	s, err := Open(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"a", "b", "c"} {
+		if err := s.Put([]byte(d)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fails := 2
+	s.fault = func() error {
+		if fails > 0 {
+			fails--
+			return &os.PathError{Op: "write", Path: "x", Err: syscall.ENOSPC}
+		}
+		return nil
+	}
+	if err := s.Put([]byte("d")); err != nil {
+		t.Fatalf("put on a full disk: %v", err)
+	}
+	var got []string
+	for _, n := range s.Oldest(10) {
+		b, _ := s.Read(n)
+		got = append(got, string(b))
+	}
+	if strings.Join(got, ",") != "c,d" || s.TakeDropped() != 2 {
+		t.Fatalf("kept %v, want the newest two", got)
+	}
+	// nothing left to drop: the error comes back
+	s.fault = func() error { return &os.PathError{Op: "write", Path: "x", Err: syscall.ENOSPC} }
+	if err := s.Put([]byte("e")); err == nil {
+		t.Fatal("a disk that stays full reported success")
+	}
+}
+
+func TestSplitKeepsThePlace(t *testing.T) {
+	s, err := Open(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"first", "big", "last"} {
+		if err := s.Put([]byte(d)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Split(s.Oldest(3)[1], [][]byte{[]byte("big-1"), []byte("big-2")}); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, n := range s.Oldest(10) {
+		b, _ := s.Read(n)
+		got = append(got, string(b))
+	}
+	if strings.Join(got, ",") != "first,big-1,big-2,last" {
+		t.Fatalf("after split: %v", got)
 	}
 }

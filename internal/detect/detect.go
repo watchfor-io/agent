@@ -503,9 +503,9 @@ func (s Summary) YAML(o Options) string {
 			ifaces[i] += " (" + a[0] + ")"
 		}
 	}
-	note(2, "Found on this machine (loopback, docker*, veth*, br-*, virbr* already ignored): "+found(ifaces))
+	note(2, "Found on this machine (loopback and container/VM/Kubernetes plumbing already ignored): "+found(ifaces))
 	kv(4, o.Interfaces != nil, "interfaces", yqList(firstList(o.Interfaces, s.Interfaces, nil)), "")
-	kv(4, o.IgnoreIfaces != nil, "ignore", yqList(firstList(o.IgnoreIfaces, []string{"lo", "veth*", "docker*", "br-*", "virbr*"}, nil)), "")
+	kv(4, o.IgnoreIfaces != nil, "ignore", yqList(firstList(o.IgnoreIfaces, network.DefaultIgnore, nil)), "")
 	w("\n  processes:                              # state counts, top consumers, watches\n")
 	kv(4, true, "top", fmt.Sprint(o.Top), "top CPU and memory consumers reported each batch")
 	if len(o.Watches) > 0 {

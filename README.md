@@ -417,7 +417,7 @@ modules:
     ignore_fs: [nfs, fuse.sshfs]            # skip filesystem types on top of the built-in pseudo-fs list
     io: false                               # no I/O rates at all
   network:
-    interfaces: [eth0]                      # only these (default: all but lo, veth*, docker*, br-*, virbr*)
+    interfaces: [eth0]                      # only these (default: all but loopback and container/VM/Kubernetes plumbing: veth*, docker*, br-*, virbr*, cali*, flannel*, cni*, lxc* …)
   processes:
     top: 5                                  # top CPU and memory consumers per batch
     watch:                                  # named processes: running or not, CPU, memory — alertable

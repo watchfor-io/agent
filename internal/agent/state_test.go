@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/watchfor-io/agent/internal/metric"
 	"github.com/watchfor-io/agent/internal/push"
 	"github.com/watchfor-io/agent/internal/spool"
 	"github.com/watchfor-io/agent/internal/update"
@@ -50,7 +51,11 @@ func TestReplayDropsUnreadableAndPausesOnRejection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sp.Put([]byte("{}")); err != nil {
+	batch, err := push.Encode(&metric.Payload{Version: metric.PayloadVersion, Samples: []metric.Sample{{T: 1, M: "x", V: 1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.Put(batch); err != nil {
 		t.Fatal(err)
 	}
 	// an older file nobody can read sorts first
