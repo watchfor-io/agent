@@ -32,6 +32,16 @@ const Path = "/v1/agent/metrics"
 // stops — an outage to retry through it is not.
 var ErrUnauthorized = errors.New("token rejected by the server")
 
+// ErrPlanPaused is ingest's 403 plan_forbidden: the token is fine, but the
+// organization's plan does not take this host right now (no server
+// monitoring in the plan, or over its host limit — WatchFor pauses the
+// newest hosts and restores them when the limit allows). It is never a
+// reason to stop for good, and not a reason to keep batches either.
+var ErrPlanPaused = errors.New("host paused by WatchFor")
+
+// PlanForbidden is the reason ingest gives for ErrPlanPaused.
+const PlanForbidden = "plan_forbidden"
+
 // ReasonHeader is set by WatchFor's ingest on every 401/403/503 it produces
 // (token_unknown, plan_forbidden, lookup_unavailable). A 401 without it did
 // not come from ingest — a proxy, CDN or captive portal answered — and is
@@ -71,7 +81,7 @@ func Retryable(err error) bool {
 		}
 		return se.Code >= 500
 	}
-	return err != nil && !errors.Is(err, ErrUnauthorized)
+	return err != nil && !errors.Is(err, ErrUnauthorized) && !errors.Is(err, ErrPlanPaused)
 }
 
 // RetryAfter is how long the server asked us to wait, when it did.
@@ -138,8 +148,12 @@ func New(baseURL, token, caFile string, timeout time.Duration, version string) (
 // TokenFingerprint identifies the token without revealing it (first 12
 // hex digits of its SHA-256): the rejected-token marker is keyed on it, so
 // a new token clears the block by itself.
-func (c *Client) TokenFingerprint() string {
-	sum := sha256.Sum256([]byte(c.token))
+func (c *Client) TokenFingerprint() string { return Fingerprint(c.token) }
+
+// Fingerprint is TokenFingerprint for a token at hand — `health` compares
+// it with the rejected-token record without building a client.
+func Fingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:6])
 }
 
@@ -205,8 +219,15 @@ func (c *Client) Send(ctx context.Context, body []byte) (Ack, error) {
 		// Any reason at all means ingest answered (a proxy never sets the
 		// header); today it says token_unknown or plan_forbidden, and a
 		// value added later must not be mistaken for an outage.
-		if strings.TrimSpace(res.Header.Get(ReasonHeader)) == "" {
+		reason := strings.TrimSpace(res.Header.Get(ReasonHeader))
+		if reason == "" {
 			return Ack{}, &StatusError{Code: res.StatusCode, Body: strings.TrimSpace(string(msg))}
+		}
+		if reason == PlanForbidden {
+			if body := strings.TrimSpace(string(msg)); body != "" {
+				return Ack{}, fmt.Errorf("%w: %s", ErrPlanPaused, body)
+			}
+			return Ack{}, ErrPlanPaused
 		}
 		// Keep the server's reason: "unknown or revoked token" and "hosts are
 		// not included in this plan" call for different fixes.

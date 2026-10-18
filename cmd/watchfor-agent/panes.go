@@ -193,7 +193,11 @@ func (s *screen) livePane() string {
 			break
 		}
 		rss, _ := s.metric("proc.rss_bytes", metric.Labels{"pid": p.L["pid"]})
-		fmt.Fprintf(&b, "  %-18s %5.1f%%  %9s  %s\n", ansi.Truncate(p.L["name"], 18, "…"), p.V, fmtBytesShort(rss), stDim.Render(p.L["user"]))
+		who := p.L["user"]
+		if c := p.L["container"]; c != "" {
+			who += " in " + c
+		}
+		fmt.Fprintf(&b, "  %-18s %5.1f%%  %9s  %s\n", ansi.Truncate(p.L["name"], 18, "…"), p.V, fmtBytesShort(rss), stDim.Render(who))
 	}
 	if total, ok := s.metric("proc.total"); ok {
 		running, _ := s.metric("proc.running")

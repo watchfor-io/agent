@@ -1,6 +1,9 @@
 package agent
 
 import (
+	"os"
+	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -44,5 +47,42 @@ func TestRejectionBecomesStickyOnlyAfterRepeatedRejections(t *testing.T) {
 	ClearRejected(dir)
 	if _, ok := ReadRejection(dir, "def"); ok {
 		t.Fatal("record survived ClearRejected")
+	}
+}
+
+// The marker lives in a folder root sometimes writes to: a symlink or a
+// FIFO planted under its name neither redirects the write nor stalls the
+// read.
+func TestRejectedMarkerIgnoresPlantedFiles(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, []byte("keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(dir, RejectedMarker)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ReadRejection(dir, "abc"); ok {
+		t.Error("read a record through a symlink")
+	}
+	if _, err := RecordRejection(dir, "abc", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(victim); string(b) != "keep\n" {
+		t.Errorf("the write went through the symlink: %q", b)
+	}
+	fifo := filepath.Join(t.TempDir(), "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skip("no mkfifo here")
+	}
+	if err := os.Rename(fifo, filepath.Join(filepath.Dir(fifo), RejectedMarker)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { ReadRejection(filepath.Dir(fifo), "abc"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reading a FIFO marker hung")
 	}
 }

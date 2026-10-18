@@ -24,6 +24,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -46,6 +48,19 @@ var Version = "dev"
 const (
 	defaultConfig = "/etc/watchfor-agent/agent.yml"
 	onceGap       = time.Second
+	// onceDeadline bounds a whole `once` — both collections, the push and
+	// the spool replay — well inside cron's minute, and onceHardStop ends
+	// the process even if something ignores the deadline. With the lock,
+	// a run that hangs anyway (a syscall on a dead NFS mount) costs one
+	// stuck process, never one more per minute.
+	onceDeadline = 40 * time.Second
+	onceHardStop = 55 * time.Second
+	// runLockWait is how long `run` waits for the lock: long enough for a
+	// cron `once` to finish, short enough for systemd to say why.
+	runLockWait = 90 * time.Second
+	// onceRejectedQuiet is how long cron's `once` leaves a token the
+	// server rejected for good alone before asking again.
+	onceRejectedQuiet = time.Hour
 
 	exitOK    = 0
 	exitError = 1
@@ -168,6 +183,12 @@ func runCollector(cmd, configPath string) int {
 		return exitOK
 	}
 
+	inst, code, proceed := lockInstance(ctx, cmd, cfg.Spool.Dir, log)
+	if !proceed {
+		return code
+	}
+	defer inst.Release()
+
 	client, code := newSink(cfg, configPath, log)
 	if code != exitOK {
 		return code
@@ -175,16 +196,23 @@ func runCollector(cmd, configPath string) int {
 	opts.Sink = client
 	opts.StateDir = cfg.Spool.Dir // only a sending agent records hints and rejections
 	// A token the server kept rejecting (host removed in WatchFor, or token
-	// rotated) is not tried again: say why and stop, until a different
-	// token is configured. A rejection that has not held long enough yet
-	// is retried normally.
+	// rotated) is not knocked with every minute from cron: `once` stays
+	// quiet for an hour after the last rejection. A start of the daemon is
+	// a person's doing (systemd does not restart after exit 3) or a boot,
+	// so it always tries once more: the host may have been restored, and a
+	// rejection then stops it again at once. A different token clears the
+	// record by itself.
 	opts.TokenFingerprint = client.TokenFingerprint()
 	if rec, ok := agent.ReadRejection(cfg.Spool.Dir, opts.TokenFingerprint); ok && rec.Sticky() {
-		log.Error("token rejected by the server; not retrying",
-			"rejections", rec.Count, "since", rec.First.Format(time.RFC3339), "last", rec.Last.Format(time.RFC3339),
-			"why", "the host was removed in WatchFor or its token was rotated",
-			"fix", "put the new token in "+cfg.Server.TokenFile+" and restart, or stop the agent: sudo systemctl disable --now watchfor-agent")
-		return exitAuth
+		if cmd == "once" && time.Since(rec.Last) < onceRejectedQuiet {
+			log.Error("token rejected by the server; not retrying yet",
+				"rejections", rec.Count, "since", rec.First.Format(time.RFC3339), "last", rec.Last.Format(time.RFC3339),
+				"why", "WatchFor does not know this token: the host was removed in WatchFor or its token was rotated",
+				"fix", "put the new token in "+cfg.Server.TokenFile)
+			return exitAuth
+		}
+		log.Warn("the server rejected this token before; trying once more",
+			"rejections", rec.Count, "last", rec.Last.Format(time.RFC3339))
 	}
 	opts.Spool = openSpool(cfg, log)
 
@@ -193,16 +221,28 @@ func runCollector(cmd, configPath string) int {
 		"interval", cfg.Interval.String(), "modules", names(mods), "server", cfg.Server.URL)
 
 	if cmd == "once" {
-		err = a.Once(ctx, onceGap)
+		octx, cancel := context.WithTimeout(ctx, onceDeadline)
+		defer cancel()
+		hard := time.AfterFunc(onceHardStop, func() {
+			log.Error("once is still running after "+onceHardStop.String()+"; giving up so runs cannot pile up", "stacks", stacks())
+			os.Exit(exitError)
+		})
+		defer hard.Stop()
+		err = a.Once(octx, onceGap)
 	} else {
 		var code int
-		if code, err = runDaemon(ctx, a, configPath, log); code != 0 {
+		if code, err = runDaemon(ctx, a, configPath, cfg.Server.TokenFile, log); code != 0 {
 			return code
 		}
 	}
 	switch {
 	case errors.Is(err, agent.ErrTokenRejected):
 		return exitAuth
+	case errors.Is(err, agent.ErrNotAccepted):
+		return exitError // the reason is already in the log
+	case errors.Is(err, context.DeadlineExceeded) && cmd == "once":
+		log.Error("once ran out of time; what was collected is in the spool", "deadline", onceDeadline.String())
+		return exitError
 	case err != nil && !errors.Is(err, context.Canceled):
 		log.Error("stopped", "error", err)
 		return exitError
@@ -211,6 +251,81 @@ func runCollector(cmd, configPath string) int {
 		log.Info("stopped") // a clean stop reads differently from a crash in the journal
 	}
 	return exitOK
+}
+
+// lockInstance makes sure one agent sends for this host at a time: the
+// service and a cron entry both installed, or a manual `run` next to the
+// service, would otherwise push every batch twice and replay one spool
+// from two processes. A `once` that finds the lock taken steps aside
+// without a word (cron would mail it every minute); `run` waits for a
+// `once` to finish, then refuses with the reason. proceed is false when
+// the caller should exit with code.
+func lockInstance(ctx context.Context, cmd, dir string, log *slog.Logger) (inst *agent.Instance, code int, proceed bool) {
+	if dir == "" {
+		return nil, exitOK, true
+	}
+	inst, err := agent.Lock(ctx, dir, 0)
+	if errors.Is(err, agent.ErrBusy) && cmd == "run" {
+		log.Info("another watchfor-agent holds the state directory; waiting for it to finish", "lock", filepath.Join(dir, agent.LockFile))
+		inst, err = agent.Lock(ctx, dir, runLockWait)
+	}
+	switch {
+	case err == nil:
+		return inst, exitOK, true
+	case errors.Is(err, agent.ErrBusy) && cmd == "once":
+		log.Debug("another watchfor-agent is running; this once steps aside", "lock", filepath.Join(dir, agent.LockFile))
+		return nil, exitOK, false
+	case errors.Is(err, agent.ErrBusy):
+		log.Error("another watchfor-agent is already running for this host; not starting a second one",
+			"lock", filepath.Join(dir, agent.LockFile),
+			"who", "the systemd service, /etc/cron.d/watchfor-agent, or a manual run",
+			"fix", "keep one: sudo watchfor-agent health shows which are installed")
+		return nil, exitError, false
+	case ctx.Err() != nil: // stopped while waiting
+		return nil, exitOK, false
+	}
+	// A lock that cannot be taken at all (the folder missing, a file root
+	// left unreadable) must not stop the agent from sending.
+	log.Warn("single-instance lock unavailable; running without it", "dir", dir, "error", err)
+	return nil, exitOK, true
+}
+
+// stalls is what the stall guard asks; *agent.Agent in production.
+type stalls interface {
+	Stalled(now time.Time) (time.Duration, bool)
+}
+
+// stallEvery is how often the daemon looks for a stuck round.
+var stallEvery = 30 * time.Second
+
+// stallGuard ends a daemon whose collection round is stuck — a module in
+// a syscall that never returns (a hung NFS or FUSE mount), a deadlock —
+// with the goroutines' stacks in the journal. The unit's Restart=always
+// starts a fresh agent; without this the service would look active and
+// send nothing, for ever.
+func stallGuard(ctx context.Context, a stalls, log *slog.Logger, exit func(int)) {
+	t := time.NewTicker(stallEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			if d, stuck := a.Stalled(now); stuck {
+				log.Error("a collection round is stuck; exiting so the service manager starts a fresh agent",
+					"stuck_for", d.Round(time.Second).String(), "stacks", stacks())
+				exit(exitError)
+				return
+			}
+		}
+	}
+}
+
+// stacks is every goroutine's stack, capped, for the log line that
+// explains a forced exit.
+func stacks() string {
+	buf := make([]byte, 256<<10)
+	return string(buf[:runtime.Stack(buf, true)])
 }
 
 // loadRunConfig reads agent.yml. `check` may run without one, on the
@@ -262,26 +377,47 @@ func openSpool(cfg *config.Config, log *slog.Logger) *spool.Spool {
 	return sp
 }
 
-// runDaemon is the collector loop with agent.yml under watch: a valid
-// change ends the run with ExitReload and systemd starts it again on the
-// new file, so `configure`, an editor or Ansible take effect within
-// seconds. code is non-zero only for that exit.
-func runDaemon(ctx context.Context, a *agent.Agent, configPath string, log *slog.Logger) (code int, err error) {
+// runDaemon is the collector loop with agent.yml and the token file under
+// watch: a valid change ends the run with ExitReload and systemd starts it
+// again on the new file, so `configure`, an editor, Ansible or a re-run
+// installer with a rotated token take effect within seconds. code is
+// non-zero only for that exit.
+func runDaemon(ctx context.Context, a *agent.Agent, configPath, tokenFile string, log *slog.Logger) (code int, err error) {
 	runCtx, cancelRun := context.WithCancel(ctx)
-	watch := make(chan error, 1)
-	go func() {
-		werr := config.Watch(runCtx, configPath, true, func(werr error) {
-			log.Warn("agent.yml changed but the agent would not accept it; keeping the running config", "error", werr)
-		})
+	watches := 1
+	watch := make(chan error, 2)
+	reload := func(werr error) {
 		watch <- werr
 		if werr != nil {
 			cancelRun() // a valid change: stop the run, we exit to be started again
 		}
+	}
+	go func() {
+		reload(config.Watch(runCtx, configPath, true, func(werr error) {
+			log.Warn("agent.yml changed but the agent would not accept it; keeping the running config", "error", werr)
+		}))
 	}()
+	if tokenFile != "" {
+		watches++
+		go func() {
+			werr := config.WatchToken(runCtx, tokenFile)
+			if werr != nil {
+				log.Info("the token file holds a new token; restarting on it", "file", tokenFile)
+			}
+			reload(werr)
+		}()
+	}
+	go stallGuard(runCtx, a, log, os.Exit)
 	err = a.Run(runCtx)
 	cancelRun()
-	if werr := <-watch; errors.Is(werr, config.ErrReload) && (err == nil || errors.Is(err, context.Canceled)) {
-		log.Info("agent.yml changed; restarting on the new config")
+	changed := false
+	for range watches {
+		if werr := <-watch; errors.Is(werr, config.ErrReload) {
+			changed = true
+		}
+	}
+	if changed && (err == nil || errors.Is(err, context.Canceled)) {
+		log.Info("configuration changed; restarting on it")
 		return config.ExitReload, nil
 	}
 	return 0, err

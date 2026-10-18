@@ -3,10 +3,8 @@
 package processes
 
 import (
-	"os/user"
 	"path"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/watchfor-io/agent/internal/procfs"
@@ -29,7 +27,7 @@ func Discover() ([]Running, error) {
 	if err != nil {
 		return nil, err
 	}
-	users := map[int]string{}
+	own := newOwners()
 	byName := map[string]*Running{}
 	for _, pid := range pids {
 		p, err := procfs.ReadProcess(pid)
@@ -42,7 +40,7 @@ func Discover() ([]Running, error) {
 		}
 		g, ok := byName[p.Comm]
 		if !ok {
-			g = &Running{Name: p.Comm, User: userName(users, p.UID), Cmdline: cmd}
+			g = &Running{Name: p.Comm, User: own.user(p), Cmdline: cmd}
 			byName[p.Comm] = g
 		}
 		g.Count++
@@ -122,7 +120,7 @@ func Matches(w Watch) int {
 	if err != nil {
 		return 0
 	}
-	users := map[int]string{}
+	own := newOwners()
 	n := 0
 	for _, pid := range pids {
 		p, err := procfs.ReadProcess(pid)
@@ -135,25 +133,10 @@ func Matches(w Watch) int {
 		if w.Cmdline != "" && !strings.Contains(procfs.Cmdline(pid, cmdlineCap), w.Cmdline) {
 			continue
 		}
-		if w.User != "" && userName(users, p.UID) != w.User {
+		if w.User != "" && own.user(p) != w.User {
 			continue
 		}
 		n++
 	}
 	return n
-}
-
-func userName(cache map[int]string, uid int) string {
-	if uid < 0 {
-		return ""
-	}
-	if name, ok := cache[uid]; ok {
-		return name
-	}
-	name := strconv.Itoa(uid)
-	if u, err := user.LookupId(name); err == nil {
-		name = procfs.Clean(u.Username)
-	}
-	cache[uid] = name
-	return name
 }

@@ -30,12 +30,17 @@ func runUpgrade(args []string) int {
 	ifAvailable := fs.Bool("if-available", false, "act only on the running agent's hint; never ask watchfor.io")
 	noRestart := fs.Bool("no-restart", false, "do not restart the systemd service afterwards")
 	allowDowngrade := fs.Bool("allow-downgrade", false, "permit a lower version than the running one")
+	syncUnits := fs.Bool("sync-units", false, "bring the service unit and cron file up to this release where they are unmodified, then exit")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() > 0 {
 		fmt.Fprintf(os.Stderr, "unexpected argument %q\n", fs.Arg(0))
 		return exitUsage
+	}
+
+	if *syncUnits {
+		return runSyncUnits()
 	}
 
 	// Read settings without requiring the token (config.Get validates the
@@ -59,6 +64,7 @@ func runUpgrade(args []string) int {
 		IfAvailable:    *ifAvailable,
 		AllowDowngrade: *allowDowngrade,
 		Restart:        !*noRestart,
+		SyncUnits:      !*noRestart,
 		Out:            os.Stdout,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -84,6 +90,27 @@ func runUpgrade(args []string) int {
 
 	if _, err := update.Run(ctx, opts); err != nil {
 		fmt.Fprintln(os.Stderr, "upgrade:", err)
+		return exitError
+	}
+	return exitOK
+}
+
+// runSyncUnits is `upgrade -sync-units`, which `upgrade` runs with the
+// binary it has just installed: the new release's unit and cron file
+// replace an earlier release's untouched ones; an edited file is named and
+// left alone (`health` keeps pointing at it).
+func runSyncUnits() int {
+	ctx, cancel := context.WithTimeout(context.Background(), update.CommandTimeout)
+	defer cancel()
+	changed, kept, err := update.SyncUnits(ctx, "", "", execCmdCombined)
+	for _, c := range changed {
+		fmt.Printf("updated %s to this release's\n", c)
+	}
+	for _, k := range kept {
+		fmt.Printf("kept %s: it was changed locally (put changes in a drop-in: sudo systemctl edit watchfor-agent)\n", k)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sync-units:", err)
 		return exitError
 	}
 	return exitOK

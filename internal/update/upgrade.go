@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -55,6 +54,10 @@ type Options struct {
 	AllowDowngrade bool
 	// Restart runs `systemctl restart <Unit>` when the unit is active.
 	Restart bool
+	// SyncUnits asks the newly installed binary to bring the service unit
+	// and cron file up to its own release (`upgrade -sync-units`) before
+	// the restart, so hardening in a new unit reaches upgraded hosts.
+	SyncUnits bool
 	// ExePath is the binary to replace; default: the running executable.
 	ExePath string
 	// Unit is the systemd service name; default DefaultUnit.
@@ -101,9 +104,7 @@ func (o Options) withDefaults() Options {
 		o.Out = io.Discard
 	}
 	if o.Exec == nil {
-		o.Exec = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			return exec.CommandContext(ctx, name, args...).CombinedOutput()
-		}
+		o.Exec = Command
 	}
 	if len(o.publicKeys) == 0 {
 		o.publicKeys = publicKeys
@@ -239,6 +240,15 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	res.Updated = true
 	_ = ClearState(o.StateDir)
 	fmt.Fprintf(o.Out, "installed watchfor-agent %s at %s\n", target, exe)
+	if o.SyncUnits {
+		// An older release (a downgrade) does not know the flag: its units
+		// stay as they are, which is what it would ship anyway — or newer.
+		if out, err := o.Exec(ctx, exe, "upgrade", "-sync-units"); err != nil {
+			fmt.Fprintf(o.Out, "the service unit was left as it is (%s)\n", strings.TrimSpace(string(out)))
+		} else if s := strings.TrimSpace(string(out)); s != "" {
+			fmt.Fprintln(o.Out, s)
+		}
+	}
 
 	if o.Restart {
 		if _, err := o.Exec(ctx, "systemctl", "is-active", "--quiet", o.Unit); err == nil {

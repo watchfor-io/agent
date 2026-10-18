@@ -1,0 +1,6 @@
+# /etc/cron.d/watchfor-agent — the one-shot variant for hosts without a
+# long-running service (or where a daemon is not wanted). `once` collects two
+# samples a second apart (rates need both), pushes one batch and exits; the
+# spool catches up if the server was unreachable. Cron cannot go below a
+# minute; the plan minimum applies on top of that, so every minute is fine.
+* * * * * watchfor-agent /usr/local/bin/watchfor-agent once -config /etc/watchfor-agent/agent.yml
