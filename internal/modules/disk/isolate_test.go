@@ -66,7 +66,7 @@ func TestHelperLeavesAHungMountBehindAndRemembersIt(t *testing.T) {
 	t.Cleanup(func() { killHelper = oldKill })
 	t.Cleanup(func() { Isolate(""); RememberHungIn("") })
 
-	run := func() (*module, error, time.Duration) {
+	run := func() (*module, time.Duration, error) {
 		m, err := New(testutil.Node(t, "io: false\nmounts: ["+good1+", "+hang+", "+good2+"]\n"))
 		if err != nil {
 			t.Fatal(err)
@@ -81,9 +81,9 @@ func TestHelperLeavesAHungMountBehindAndRemembersIt(t *testing.T) {
 				t.Fatalf("%s not reported while %s hangs", p, hang)
 			}
 		}
-		return mod, err, time.Since(start)
+		return mod, time.Since(start), err
 	}
-	_, err, took := run()
+	_, took, err := run()
 	if err == nil || !strings.Contains(err.Error(), hang) || took > 3*time.Second {
 		t.Fatalf("first run: %v after %s", err, took)
 	}
@@ -107,7 +107,7 @@ func TestHelperLeavesAHungMountBehindAndRemembersIt(t *testing.T) {
 		return n
 	}
 	before := helpers()
-	if _, err, took = run(); err == nil || took > 2*time.Second {
+	if _, took, err = run(); err == nil || took > 2*time.Second {
 		t.Fatalf("second run: %v after %s", err, took)
 	}
 	if after := helpers(); after > before {
@@ -119,7 +119,7 @@ func TestHelperLeavesAHungMountBehindAndRemembersIt(t *testing.T) {
 		_, _ = p.Wait()
 	}
 	t.Setenv("WF_TEST_HANG", "")
-	if _, err, _ := run(); err != nil {
+	if _, _, err := run(); err != nil {
 		t.Fatalf("after the mount came back: %v", err)
 	}
 	if recs := (&hungStore{dir: state}).read(); len(recs) != 0 {

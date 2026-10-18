@@ -181,7 +181,6 @@ helpers:
 					for _, i := range idx[done:] {
 						out[i].err = errors.New("statfs helper ended early")
 					}
-					done = len(idx)
 					break read
 				}
 				out[idx[done]].st, out[idx[done]].err = parseHelperLine(line)
