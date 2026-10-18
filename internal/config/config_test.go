@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -129,5 +130,97 @@ func TestModulesKeepTheirNodes(t *testing.T) {
 func TestEmptyFile(t *testing.T) {
 	if _, err := parse(t, ""); err != nil {
 		t.Fatalf("an empty config should mean all defaults: %v", err)
+	}
+}
+
+// A token file with a second line or a character no header may carry is
+// a config error at load — not a failing push retried into the spool —
+// and a FIFO in its place is refused at once instead of blocking.
+func TestTokenFileContents(t *testing.T) {
+	dir := t.TempDir()
+	write := func(body string) string {
+		p := filepath.Join(dir, "token")
+		_ = os.Remove(p)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	load := func(tokenFile string) (*Config, error) {
+		return Parse(strings.NewReader("server:\n  url: https://ingest.example\n  token_file: " + tokenFile + "\n"))
+	}
+	if c, err := load(write("\n  wfh_abc \n\n")); err != nil || c.Server.Token != "wfh_abc" {
+		t.Fatalf("one token with blank lines around it: %v", err)
+	}
+	if _, err := load(write("wfh_abc\nwfh_def\n")); err == nil || !strings.Contains(err.Error(), "2 lines") {
+		t.Errorf("two lines: %v", err)
+	}
+	if _, err := load(write("wfh_a\x01bc\n")); err == nil {
+		t.Error("a control character was accepted")
+	}
+	if _, err := load(write("wfh abc\n")); err == nil {
+		t.Error("a space inside the token was accepted")
+	}
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skip("mkfifo:", err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := load(fifo); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a plain file") {
+			t.Errorf("FIFO token: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a FIFO token_file blocked the load")
+	}
+}
+
+// run/once refuse an agent.yml, or a token folder, that another local
+// user could change: they could point server.url elsewhere and receive
+// the token.
+func TestCheckOwnership(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tok := filepath.Join(dir, "token")
+	if err := os.WriteFile(tok, []byte("wfh_x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "agent.yml")
+	if err := os.WriteFile(path, []byte("server:\n  url: https://ingest.example\n  token_file: "+tok+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.CheckOwnership(path); err != nil {
+		t.Fatalf("0644 in a 0755 folder: %v", err)
+	}
+	for _, mode := range []os.FileMode{0o666, 0o664, 0o646} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := cfg.CheckOwnership(path); err == nil || !strings.Contains(err.Error(), "server.url") {
+			t.Errorf("agent.yml %04o: %v", mode, err)
+		}
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.CheckOwnership(path); err == nil {
+		t.Error("a world-writable folder was accepted")
+	}
+	if err := os.Chmod(dir, 0o777|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.CheckOwnership(path); err != nil {
+		t.Errorf("a sticky folder like /tmp: %v", err)
 	}
 }

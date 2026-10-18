@@ -228,19 +228,59 @@ func configFile(o Options) Check {
 			c.Detail += elsewhere
 		}
 		return c
-	case st.Mode().Perm()&0o022 != 0:
-		c.State = Warn
-		c.Detail = fmt.Sprintf("writable by others (%04o)", st.Mode().Perm())
+	case st.Mode().Perm()&0o022 != 0 || !configOwnerOK(st):
+		// Whoever can change agent.yml can point server.url at their own
+		// server and receive the token with the next push.
+		c.State = Fail
+		if st.Mode().Perm()&0o022 != 0 {
+			c.Detail = fmt.Sprintf("writable by others (%04o) — anyone who can change it can redirect the agent and receive the token; run and once refuse it", st.Mode().Perm())
+		} else {
+			c.Detail = fmt.Sprintf("owned by %s — that account can redirect the agent and receive the token; it belongs to root", orUnknown(fileOwner(st)))
+		}
 		if standard(o.ConfigPath, o.Layout.Config) {
-			c.FixMsg = "set it to 0644"
-			c.Fix = func(context.Context) error { return mode(o.ConfigPath, 0o644) }
+			c.FixMsg = "set it to 0644, owned by root"
+			c.Fix = func(context.Context) error { return rootFile(o.ConfigPath, 0o644) }
 		} else {
 			c.Detail += elsewhere
 		}
 		return c
 	}
+	if d := writableDir(o.ConfigPath); d != "" {
+		c.State = Fail
+		c.Detail = "the folder " + d + " is writable by others, so agent.yml can be replaced — sudo chmod go-w " + d
+		return c
+	}
 	c.State, c.Detail = OK, fmt.Sprintf("reads cleanly · %04o", st.Mode().Perm())
 	return c
+}
+
+// configOwnerOK: agent.yml belongs to root, the service account (the
+// agent rewrites nothing in it, but the account is the agent itself), or
+// whoever runs the agent by hand.
+func configOwnerOK(st os.FileInfo) bool {
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok || sys.Uid == 0 || int(sys.Uid) == os.Geteuid() {
+		return true
+	}
+	if u, err := user.Lookup(ServiceUser); err == nil && u.Uid == strconv.FormatUint(uint64(sys.Uid), 10) {
+		return true
+	}
+	return false
+}
+
+// writableDir is the folder of path (or of what it links to) when other
+// users may write it without the sticky bit — "" when none is.
+func writableDir(path string) string {
+	dirs := []string{filepath.Dir(path)}
+	if real, err := filepath.EvalSymlinks(path); err == nil && filepath.Dir(real) != dirs[0] {
+		dirs = append(dirs, filepath.Dir(real))
+	}
+	for _, d := range dirs {
+		if st, err := os.Stat(d); err == nil && st.Mode().Perm()&0o022 != 0 && st.Mode()&os.ModeSticky == 0 {
+			return d
+		}
+	}
+	return ""
 }
 
 func binary(o Options) Check {
@@ -386,6 +426,17 @@ func tokenFile(o Options) Check {
 			c.Fix = func(context.Context) error { return Private(path, ServiceUser) }
 		} else {
 			c.Detail += elsewhere
+		}
+		return c
+	}
+	if d := writableDir(path); d != "" {
+		c.State = Fail
+		c.Detail = "the folder " + d + " is writable by others, so the token can be replaced"
+		if standard(path, o.Layout.Token) && d == filepath.Dir(o.Layout.Token) {
+			c.FixMsg = "set " + d + " to 0750, root and the service group"
+			c.Fix = func(context.Context) error { return groupDir(d, ServiceUser) }
+		} else {
+			c.Detail += " — sudo chmod go-w " + d
 		}
 		return c
 	}
@@ -734,6 +785,43 @@ func GroupOnly(path, group string) error {
 		return err
 	}
 	return syscall.Fchown(fd, 0, gid)
+}
+
+// rootFile makes path a plain file of root's with perm, by descriptor:
+// agent.yml when someone else could change it.
+func rootFile(path string, perm os.FileMode) error {
+	fd, st, err := openNoFollow(path, false)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	if st.Mode&syscall.S_IFMT != syscall.S_IFREG || st.Nlink != 1 {
+		return fmt.Errorf("%s is not a plain file", path)
+	}
+	if err := syscall.Fchown(fd, 0, 0); err != nil {
+		return err
+	}
+	return syscall.Fchmod(fd, uint32(perm))
+}
+
+// groupDir makes the config folder what the installer makes it: 0750,
+// root and the service group.
+func groupDir(path, group string) error {
+	fd, _, err := openNoFollow(path, true)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	gid := 0
+	if _, g, ok, err := ids(group); err != nil {
+		return err
+	} else if ok {
+		gid = g
+	}
+	if err := syscall.Fchown(fd, 0, gid); err != nil {
+		return err
+	}
+	return syscall.Fchmod(fd, 0o750)
 }
 
 // ownDir hands an existing directory to the service account, by descriptor.

@@ -146,6 +146,11 @@ func run(args []string) int {
 // daemon loop with agent.yml under watch.
 func runCollector(cmd, configPath string) int {
 	cfg, err := loadRunConfig(cmd, configPath)
+	if err == nil && cmd != "check" {
+		// what sends the token must not take its orders from a file another
+		// local user can change (check sends nothing)
+		err = cfg.CheckOwnership(configPath)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "config:", err)
 		return exitError

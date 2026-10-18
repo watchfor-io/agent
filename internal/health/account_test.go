@@ -280,3 +280,44 @@ func TestRejectedRecordCheck(t *testing.T) {
 		t.Fatalf("sticky record = %+v", c)
 	}
 }
+
+// An agent.yml others can write is a failure, not a warning: whoever can
+// change it can redirect the agent and receive the token. The installed
+// file gets the root fix; a world-writable token folder fails too.
+func TestWritableConfigAndTokenFolderFail(t *testing.T) {
+	cfg, dir := withState(t)
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "agent.yml")
+	if err := os.WriteFile(path, []byte("server:\n  url: https://ingest.watchfor.io\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	o := Options{ConfigPath: path, Config: cfg, Layout: Layout{Config: path, Token: cfg.Server.TokenFile}}
+	if c := configFile(o); c.State != OK {
+		t.Fatalf("0644 = %+v", c)
+	}
+	if err := os.Chmod(path, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if c := configFile(o); c.State != Fail || c.Fix == nil || !strings.Contains(c.FixMsg, "root") {
+		t.Errorf("0666, installed path = %+v", c)
+	}
+	o.Layout.Config = "/etc/watchfor-agent/agent.yml"
+	if c := configFile(o); c.State != Fail || c.Fix != nil {
+		t.Errorf("0666 elsewhere = %+v (no repair outside the installed layout)", c)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if c := configFile(o); c.State != Fail || !strings.Contains(c.Detail, "folder") {
+		t.Errorf("world-writable folder, agent.yml = %+v", c)
+	}
+	if c := tokenFile(o); c.State != Fail || c.Fix == nil {
+		t.Errorf("world-writable folder, token = %+v", c)
+	}
+}
