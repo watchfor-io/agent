@@ -155,3 +155,52 @@ func TestPlanForbiddenIsAPauseNotARejection(t *testing.T) {
 		t.Errorf("the server's words are lost: %v", err)
 	}
 }
+
+// A redirect is spooled and retried, never followed and never a reason to
+// drop the batch; a 413 is TooLarge (the caller splits); an error body is
+// cleaned and capped before it reaches a log line; the reason ingest gave
+// travels with a rejection.
+func TestAnswersAreClassifiedAndCleaned(t *testing.T) {
+	var mode string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch mode {
+		case "redirect":
+			http.Redirect(w, r, "https://elsewhere.example/v1/agent/metrics\u202e", http.StatusTemporaryRedirect)
+		case "413":
+			http.Error(w, "too many samples in one batch", http.StatusRequestEntityTooLarge)
+		case "hostile":
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("\x1b]0;owned\x07line one\nline two\x00" + strings.Repeat("A", 5000)))
+		case "401":
+			w.Header().Set(ReasonHeader, "token_unknown")
+			http.Error(w, "unknown or revoked token", http.StatusUnauthorized)
+		}
+	}))
+	defer srv.Close()
+	c, err := New(srv.URL, "tok", "", time.Second, "9.9.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := Encode(payload())
+
+	mode = "redirect"
+	_, err = c.Send(context.Background(), body)
+	if loc, ok := Redirect(err); !ok || !Retryable(err) || !strings.HasPrefix(loc, "https://elsewhere.example/") || strings.ContainsRune(loc, 0x202e) {
+		t.Errorf("redirect: %v (location %q, retryable %v)", err, loc, Retryable(err))
+	}
+	mode = "413"
+	if _, err = c.Send(context.Background(), body); !TooLarge(err) || Retryable(err) {
+		t.Errorf("413: %v", err)
+	}
+	mode = "hostile"
+	_, err = c.Send(context.Background(), body)
+	msg := err.Error()
+	if strings.ContainsAny(msg, "\x1b\x07\x00\n") || len(msg) > maxErrorBody+64 || !strings.Contains(msg, "line one line two") {
+		t.Errorf("hostile body reached the log as %q (%d bytes)", msg, len(msg))
+	}
+	mode = "401"
+	_, err = c.Send(context.Background(), body)
+	if !errors.Is(err, ErrUnauthorized) || Reason(err) != "token_unknown" || !strings.Contains(err.Error(), "unknown or revoked token") {
+		t.Errorf("401: %v (reason %q)", err, Reason(err))
+	}
+}

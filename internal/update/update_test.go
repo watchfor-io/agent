@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -426,6 +427,48 @@ func TestRunRestartsActiveUnit(t *testing.T) {
 	}
 	if strings.Join(calls, ";") != "is-active --quiet watchfor-agent;restart watchfor-agent" {
 		t.Fatalf("systemctl calls: %v", calls)
+	}
+}
+
+// A service that stopped itself with exit 3 (up to 0.8 that included a
+// plan pause) is started by an upgrade, so the new release can look again;
+// one that is simply stopped is left alone.
+func TestRunStartsAUnitStoppedOverAToken(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   string
+	}{
+		{"3", "is-active --quiet watchfor-agent;show -p ExecMainStatus --value watchfor-agent;is-enabled --quiet watchfor-agent;start watchfor-agent"},
+		{"0", "is-active --quiet watchfor-agent;show -p ExecMainStatus --value watchfor-agent"},
+	} {
+		s := newSigner(t)
+		r := newRelease(t, s, "9.9.9", "#!/bin/sh\necho watchfor-agent 9.9.9\n", nil)
+		o := testOptions(t, r, s, "0.2.0")
+		o.Target, o.Restart = "9.9.9", true
+		var calls []string
+		o.Exec = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "systemctl" {
+				calls = append(calls, strings.Join(args, " "))
+				switch args[0] {
+				case "is-active":
+					return []byte("inactive\n"), errors.New("exit status 3")
+				case "show":
+					return []byte(tc.status + "\n"), nil
+				}
+				return nil, nil
+			}
+			return execScript(ctx, name, args...)
+		}
+		res, err := Run(context.Background(), o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(calls, ";"); got != tc.want {
+			t.Errorf("exit %s: systemctl calls %q, want %q", tc.status, got, tc.want)
+		}
+		if res.Restarted != (tc.status == "3") {
+			t.Errorf("exit %s: Restarted = %v", tc.status, res.Restarted)
+		}
 	}
 }
 

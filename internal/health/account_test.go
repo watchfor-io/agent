@@ -192,7 +192,7 @@ func TestExit3OffersNoPointlessRestart(t *testing.T) {
 	}
 	t0 := time.Now().Add(-3 * time.Hour)
 	for i := range 6 {
-		if _, err := agent.RecordRejection(dir, push.Fingerprint("wfh_x"), t0.Add(time.Duration(i)*30*time.Minute)); err != nil {
+		if _, err := agent.RecordRejection(dir, push.Fingerprint("wfh_x"), "token_unknown", t0.Add(time.Duration(i)*30*time.Minute)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -231,5 +231,52 @@ func TestReachableHonoursCAFile(t *testing.T) {
 	}
 	if err := tlsDial(ctx, "tcp", addr, ca); err != nil {
 		t.Errorf("with its CA as ca_file: %v", err)
+	}
+}
+
+// health shows the rejected-token record; a stale one (written by 0.8,
+// for a plan pause, or before the token file) comes with a fix that
+// removes it and starts a service it had stopped.
+func TestRejectedRecordCheck(t *testing.T) {
+	cfg, dir := withState(t)
+	rec := &recorder{replies: map[string]string{
+		"systemctl is-active watchfor-agent":                      "inactive",
+		"systemctl show -p ExecMainStatus --value watchfor-agent": "3",
+	}}
+	o := Options{Config: cfg, Root: true, Exec: rec.exec, HaveSystemctl: func() bool { return true }, Layout: Layout{Spool: dir, Token: cfg.Server.TokenFile}}
+	if _, ok := rejectedRecord(context.Background(), o); ok {
+		t.Fatal("no record, but a check")
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(cfg.Server.TokenFile, old, old); err != nil {
+		t.Fatal(err)
+	}
+	// written by 0.8.x: no reason field
+	t0 := time.Now().Add(-3 * time.Hour).UTC()
+	legacy := push.Fingerprint("wfh_x") + " 5 " + t0.Format(time.RFC3339) + " " + t0.Add(2*time.Hour).Format(time.RFC3339) + "\n"
+	if err := os.WriteFile(filepath.Join(dir, agent.RejectedMarker), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, ok := rejectedRecord(context.Background(), o)
+	if !ok || c.State != Warn || c.Fix == nil || !strings.Contains(c.Detail, "before 0.9") {
+		t.Fatalf("legacy record = %+v", c)
+	}
+	if err := c.Fix(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, agent.RejectedMarker)); !os.IsNotExist(err) {
+		t.Fatal("the fix left the record")
+	}
+	if !strings.Contains(strings.Join(rec.calls, ";"), "systemctl restart watchfor-agent") {
+		t.Fatalf("the service stopped over it was not started: %v", rec.calls)
+	}
+	// A confirmed rejection of the current token: fail, no automatic fix.
+	for i := range 6 {
+		if _, err := agent.RecordRejection(dir, push.Fingerprint("wfh_x"), "token_unknown", t0.Add(time.Duration(i)*30*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c, ok := rejectedRecord(context.Background(), o); !ok || c.State != Fail || c.Fix != nil || !strings.Contains(c.Detail, "does not know this token") {
+		t.Fatalf("sticky record = %+v", c)
 	}
 }

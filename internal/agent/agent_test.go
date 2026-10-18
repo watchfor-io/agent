@@ -225,7 +225,7 @@ func TestAcceptedPushClearsRejection(t *testing.T) {
 	a := newAgent(t, &fakeSink{}, nil)
 	a.o.StateDir = t.TempDir()
 	a.o.TokenFingerprint = "fp1"
-	if _, err := RecordRejection(a.o.StateDir, "fp1", time.Now()); err != nil {
+	if _, err := RecordRejection(a.o.StateDir, "fp1", "token_unknown", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.tick(context.Background()); err != nil {

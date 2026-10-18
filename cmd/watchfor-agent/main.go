@@ -203,16 +203,25 @@ func runCollector(cmd, configPath string) int {
 	// rejection then stops it again at once. A different token clears the
 	// record by itself.
 	opts.TokenFingerprint = client.TokenFingerprint()
+	// A record that no longer means anything goes before it is read: one
+	// 0.8 wrote for a plan pause (it counted plan_forbidden as a dead
+	// token and stopped the agent for good), or one older than the token
+	// file (a new or re-pasted token).
+	if why := agent.ClearStaleRejection(cfg.Spool.Dir, cfg.Server.TokenFile); why != "" {
+		log.Info("removed a stale rejected-token record", "why", why, "file", filepath.Join(cfg.Spool.Dir, agent.RejectedMarker))
+	}
 	if rec, ok := agent.ReadRejection(cfg.Spool.Dir, opts.TokenFingerprint); ok && rec.Sticky() {
 		if cmd == "once" && time.Since(rec.Last) < onceRejectedQuiet {
 			log.Error("token rejected by the server; not retrying yet",
-				"rejections", rec.Count, "since", rec.First.Format(time.RFC3339), "last", rec.Last.Format(time.RFC3339),
-				"why", "WatchFor does not know this token: the host was removed in WatchFor or its token was rotated",
-				"fix", "put the new token in "+cfg.Server.TokenFile)
+				"reason", rec.Reason, "rejections", rec.Count, "since", rec.First.Format(time.RFC3339), "last", rec.Last.Format(time.RFC3339),
+				"why", rec.Why(),
+				"fix", "put the new token in "+orDefault(cfg.Server.TokenFile, "agent.yml")+" (or, if the host is back in WatchFor, remove "+filepath.Join(cfg.Spool.Dir, agent.RejectedMarker)+")")
 			return exitAuth
 		}
 		log.Warn("the server rejected this token before; trying once more",
-			"rejections", rec.Count, "last", rec.Last.Format(time.RFC3339))
+			"reason", rec.Reason, "rejections", rec.Count, "last", rec.Last.Format(time.RFC3339))
+	} else if ok {
+		log.Debug("an earlier rejection is on record; it is not final", "reason", rec.Reason, "rejections", rec.Count)
 	}
 	opts.Spool = openSpool(cfg, log)
 
@@ -466,6 +475,13 @@ func newLogger(level string) *slog.Logger {
 	var l slog.Level
 	_ = l.UnmarshalText([]byte(level))
 	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: l}))
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }
 
 func envOr(key, def string) string {

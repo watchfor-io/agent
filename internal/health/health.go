@@ -193,6 +193,9 @@ func Run(ctx context.Context, o Options) []Check {
 	out = append(out, timer(ctx, o))
 	if o.Config != nil {
 		out = append(out, reachable(ctx, o), accepted(o))
+		if c, ok := rejectedRecord(ctx, o); ok {
+			out = append(out, c)
+		}
 	} else {
 		out = append(out, skip("WatchFor reachable"), skip("WatchFor accepts this host"))
 	}

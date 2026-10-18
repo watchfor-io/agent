@@ -24,7 +24,7 @@ func TestPlanPauseNeverStops(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	a.o.Now = func() time.Time { return now }
 	a.jitter = func(d time.Duration) time.Duration { return d }
-	if _, err := RecordRejection(dir, "abc", now.Add(-2*time.Hour)); err != nil { // left by an older agent that took the 403 for a dead token
+	if _, err := RecordRejection(dir, "abc", "token_unknown", now.Add(-2*time.Hour)); err != nil { // left by an older agent that took the 403 for a dead token
 		t.Fatal(err)
 	}
 

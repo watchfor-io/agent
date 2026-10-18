@@ -252,14 +252,15 @@ func (a *Agent) tick(ctx context.Context) error {
 // a rejection that holds across several attempts and minutes is final.
 func (a *Agent) rejected(err error, body []byte) error {
 	now := a.o.Now()
-	rec, rerr := RecordRejection(a.o.StateDir, a.o.TokenFingerprint, now)
+	reason := push.Reason(err)
+	rec, rerr := RecordRejection(a.o.StateDir, a.o.TokenFingerprint, reason, now)
 	if rerr != nil {
 		a.o.Log.Warn("could not record the rejected token; the stop-after-repeats rule cannot hold", "error", rerr)
 	}
 	if rec.Sticky() {
 		a.o.Log.Error("stopping: the server has rejected this host's token repeatedly",
-			"error", err, "rejections", rec.Count, "since", rec.First.Format(time.RFC3339),
-			"why", "the host was removed in WatchFor or its token was rotated",
+			"error", err, "reason", rec.Reason, "rejections", rec.Count, "since", rec.First.Format(time.RFC3339),
+			"why", rec.Why(),
 			"fix", "put the new token in place and restart, or stop the agent: sudo systemctl disable --now watchfor-agent")
 		return ErrTokenRejected
 	}
@@ -269,8 +270,8 @@ func (a *Agent) rejected(err error, body []byte) error {
 		_ = a.o.Spool.Put(body)
 	}
 	a.o.Log.Warn("token rejected by the server; will try again",
-		"error", err, "attempt", rec.Count, "of", StickyRejections, "retry_in", wait.String(),
-		"note", "if the host was removed in WatchFor or its token rotated, the agent stops by itself once the rejection has held for over "+StickySpan.String())
+		"error", err, "reason", rec.Reason, "why", rec.Why(), "attempt", rec.Count, "of", StickyRejections, "retry_in", wait.String(),
+		"note", "if the rejection holds for over "+StickySpan.String()+" the agent stops by itself (exit 3)")
 	return nil
 }
 

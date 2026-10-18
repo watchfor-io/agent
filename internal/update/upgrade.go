@@ -257,9 +257,31 @@ func Run(ctx context.Context, o Options) (Result, error) {
 			}
 			res.Restarted = true
 			fmt.Fprintf(o.Out, "restarted %s\n", o.Unit)
+		} else if stoppedOverToken(ctx, o) {
+			// The service stopped itself over a rejected token (exit 3, which
+			// the unit does not restart). Up to 0.8 that included a plan
+			// pause, so a host whose plan was restored stayed stopped; the
+			// new release clears such a record and checks the token once
+			// more — a token that really is gone stops it again at once.
+			if out, err := o.Exec(ctx, "systemctl", "start", o.Unit); err != nil {
+				return res, fmt.Errorf("installed, but starting %s failed: %w: %s", o.Unit, err, strings.TrimSpace(string(out)))
+			}
+			res.Restarted = true
+			fmt.Fprintf(o.Out, "started %s: it had stopped itself over a rejected token (exit 3); this release checks the token once more\n", o.Unit)
 		}
 	}
 	return res, nil
+}
+
+// stoppedOverToken: the unit is enabled, not running, and its last run
+// ended with exit 3 (the token rejected for good).
+func stoppedOverToken(ctx context.Context, o Options) bool {
+	out, err := o.Exec(ctx, "systemctl", "show", "-p", "ExecMainStatus", "--value", o.Unit)
+	if err != nil || strings.TrimSpace(string(out)) != "3" {
+		return false
+	}
+	_, err = o.Exec(ctx, "systemctl", "is-enabled", "--quiet", o.Unit)
+	return err == nil
 }
 
 // writeVerified downloads the release and writes its binary into f;

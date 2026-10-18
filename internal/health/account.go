@@ -18,6 +18,7 @@ import (
 	"github.com/watchfor-io/agent/internal/agent"
 	"github.com/watchfor-io/agent/internal/procfs"
 	"github.com/watchfor-io/agent/internal/push"
+	"github.com/watchfor-io/agent/internal/safefile"
 	"github.com/watchfor-io/agent/internal/update"
 )
 
@@ -429,19 +430,117 @@ func accepted(o Options) Check {
 	return c
 }
 
-// rejection is the rejected-token record for the token configured now.
+// rejection is the rejected-token record for the token configured now,
+// and whether it is final (a stale record never is).
 func rejection(o Options) (agent.Rejection, bool) {
-	tok := o.Config.Server.Token
-	if o.Config.Server.TokenFile != "" {
-		b, err := os.ReadFile(o.Config.Server.TokenFile)
-		if err != nil {
-			return agent.Rejection{}, false
-		}
-		tok = strings.TrimSpace(string(b))
-	}
-	if tok == "" || strings.HasPrefix(tok, "env:") {
+	tok := currentToken(o)
+	if tok == "" {
 		return agent.Rejection{}, false
 	}
 	rec, ok := agent.ReadRejection(o.Config.Spool.Dir, push.Fingerprint(tok))
-	return rec, ok && rec.Sticky()
+	if !ok || agent.StaleRejection(o.Config.Spool.Dir, o.Config.Server.TokenFile) != "" {
+		return rec, false
+	}
+	return rec, rec.Sticky()
+}
+
+// currentToken is the token agent.yml points at now, "" when it cannot be
+// read from here.
+func currentToken(o Options) string {
+	tok := o.Config.Server.Token
+	if o.Config.Server.TokenFile != "" {
+		b, err := safefile.ReadFile(o.Config.Server.TokenFile, 4<<10)
+		if err != nil {
+			return ""
+		}
+		tok = strings.TrimSpace(string(b))
+	}
+	if strings.HasPrefix(tok, "env:") {
+		return ""
+	}
+	return tok
+}
+
+// rejectedRecord shows the agent's rejected-token record when there is
+// one: what it says, whether it still counts, and — when it does not (it
+// is for an earlier token, it was written for a plan pause or by an agent
+// before 0.9 that counted plan pauses as dead tokens, or the token file is
+// newer) — a fix that removes it, and starts the service again if the
+// record had stopped it. ok is false when there is no record to show.
+func rejectedRecord(ctx context.Context, o Options) (Check, bool) {
+	c := Check{Name: "rejected-token record"}
+	dir := o.Config.Spool.Dir
+	path := filepath.Join(dir, agent.RejectedMarker)
+	if _, err := os.Lstat(path); err != nil {
+		return c, false
+	}
+	rec, ok := agent.ReadAnyRejection(dir)
+	tok := currentToken(o)
+	stale := agent.StaleRejection(dir, o.Config.Server.TokenFile)
+	switch {
+	case !ok && stale == "":
+		return c, false
+	case stale == "" && tok != "" && rec.Fingerprint != push.Fingerprint(tok):
+		stale = "it is for an earlier token"
+	case stale == "" && rec.Reason == "":
+		stale = "an agent before 0.9 wrote it, and those counted a plan pause as a rejected token; the agent checks the token once more on its next start"
+	}
+	when := ""
+	if ok {
+		when = fmt.Sprintf(" — %d rejections since %s", rec.Count, rec.First.Local().Format("2006-01-02 15:04"))
+	}
+	if stale != "" {
+		c.State = Warn
+		c.Detail = "a stale record" + when + ": " + stale
+		if o.Root && standard(dir, o.Layout.Spool) {
+			c.FixMsg = "remove " + path + " (and start the service if it had stopped over it)"
+			c.Fix = func(ctx context.Context) error { return clearRejected(ctx, o, dir) }
+		} else {
+			c.Detail += " · remove " + path
+		}
+		return c, true
+	}
+	if rec.Sticky() {
+		c.State = Fail
+		c.Detail = rec.Why() + when + "; the agent has stopped (exit 3). Paste the new token in Settings → Server — or, if the host is back in WatchFor, remove " + path + " and start the service"
+		return c, true
+	}
+	c.State = Warn
+	c.Detail = rec.Why() + when + "; the agent tries again with growing pauses and stops only if it holds for over " + agent.StickySpan.String()
+	return c, true
+}
+
+// clearRejected removes the rejected-token record and, when the service
+// had stopped itself over it (exit 3), starts it again.
+func clearRejected(ctx context.Context, o Options, dir string) error {
+	if err := removeStateFile(dir, agent.RejectedMarker); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if !o.HaveSystemctl() {
+		return nil
+	}
+	if trim(o.Exec(ctx, "systemctl", "is-active", "watchfor-agent")) != "active" &&
+		trim(o.Exec(ctx, "systemctl", "show", "-p", "ExecMainStatus", "--value", "watchfor-agent")) == "3" {
+		return fixCmd(o, "systemctl", "restart", "watchfor-agent")(ctx)
+	}
+	return nil
+}
+
+// removeStateFile unlinks name inside the state directory, through a
+// descriptor of the directory opened without following links: the
+// directory belongs to the service account, so nothing in it is resolved
+// by path — whatever sits under the name is unlinked, never followed.
+func removeStateFile(dir, name string) error {
+	if filepath.Base(name) != name {
+		return fmt.Errorf("bad name %q", name)
+	}
+	fd, st, err := openNoFollow(dir, true)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	return syscall.Unlinkat(fd, name)
 }
