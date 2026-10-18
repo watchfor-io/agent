@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/watchfor-io/agent/internal/metric"
+	"github.com/watchfor-io/agent/internal/text"
 )
 
 // Path is the ingest endpoint, appended to server.url.
@@ -31,6 +32,16 @@ const Path = "/v1/agent/metrics"
 // or a plan without hosts. The agent backs off from it and, if it holds,
 // stops — an outage to retry through it is not.
 var ErrUnauthorized = errors.New("token rejected by the server")
+
+// ErrPlanPaused is ingest's 403 plan_forbidden: the token is fine, but the
+// organization's plan does not take this host right now (no server
+// monitoring in the plan, or over its host limit — WatchFor pauses the
+// newest hosts and restores them when the limit allows). It is never a
+// reason to stop for good, and not a reason to keep batches either.
+var ErrPlanPaused = errors.New("host paused by WatchFor")
+
+// PlanForbidden is the reason ingest gives for ErrPlanPaused.
+const PlanForbidden = "plan_forbidden"
 
 // ReasonHeader is set by WatchFor's ingest on every 401/403/503 it produces
 // (token_unknown, plan_forbidden, lookup_unavailable). A 401 without it did
@@ -45,22 +56,31 @@ type StatusError struct {
 	Body string
 	// RetryAfter is the server's own advice on when to try again, if any.
 	RetryAfter time.Duration
+	// Location is where a 3xx pointed (sanitized), for the log line.
+	Location string
 }
 
 // Error is the log line's wording: the status, and the body when there
 // was one.
 func (e *StatusError) Error() string {
-	if e.Body == "" {
-		return fmt.Sprintf("server answered %d", e.Code)
+	msg := fmt.Sprintf("server answered %d", e.Code)
+	if e.Location != "" {
+		msg += " (redirect to " + e.Location + ")"
 	}
-	return fmt.Sprintf("server answered %d: %s", e.Code, e.Body)
+	if e.Body != "" {
+		msg += ": " + e.Body
+	}
+	return msg
 }
 
 // Retryable reports whether a Send failure should be spooled and retried:
 // network trouble, 429, 5xx, a 404/405 (an ingest mid-deploy or a proxy's
-// default backend answering for it), and a 401/403 that did not come from
-// ingest (no reason header: something in between answered). A 4xx about
-// the batch itself (413, 400) is not retried.
+// default backend answering for it), a 401/403 that did not come from
+// ingest (no reason header: something in between answered), and a 3xx —
+// the agent never follows a redirect (the token goes only where agent.yml
+// says), but a redirect is a proxy or a moved URL, not a verdict on the
+// batch. A 400 about the batch itself is not retried; a 413 is split by
+// the caller (TooLarge), never retried as it is.
 func Retryable(err error) bool {
 	var se *StatusError
 	if errors.As(err, &se) {
@@ -69,9 +89,73 @@ func Retryable(err error) bool {
 			http.StatusNotFound, http.StatusMethodNotAllowed:
 			return true
 		}
-		return se.Code >= 500
+		return se.Code >= 500 || (se.Code >= 300 && se.Code < 400)
 	}
-	return err != nil && !errors.Is(err, ErrUnauthorized)
+	return err != nil && !errors.Is(err, ErrUnauthorized) && !errors.Is(err, ErrPlanPaused)
+}
+
+// TooLarge reports ingest's 413: the batch is over its sample or size
+// limit. It is split in halves and sent again, not dropped.
+func TooLarge(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.Code == http.StatusRequestEntityTooLarge
+}
+
+// Redirect reports a 3xx answer (with where it pointed, when it said).
+func Redirect(err error) (location string, ok bool) {
+	var se *StatusError
+	if errors.As(err, &se) && se.Code >= 300 && se.Code < 400 {
+		return se.Location, true
+	}
+	return "", false
+}
+
+// RejectError is ingest's 401/403 verdict with its machine-readable
+// reason (token_unknown, plan_forbidden, …). It matches ErrUnauthorized
+// or ErrPlanPaused with errors.Is, and Reason reads it back.
+type RejectError struct {
+	Kind   error  // ErrUnauthorized or ErrPlanPaused
+	Reason string // the X-WatchFor-Reason value
+	Msg    string // what the server said, sanitized
+}
+
+func (e *RejectError) Error() string {
+	if e.Msg == "" {
+		return e.Kind.Error()
+	}
+	return e.Kind.Error() + ": " + e.Msg
+}
+
+// Unwrap lets errors.Is find Kind.
+func (e *RejectError) Unwrap() error { return e.Kind }
+
+// Reason is the X-WatchFor-Reason ingest gave with a rejection, "" when
+// the error carries none.
+func Reason(err error) string {
+	var re *RejectError
+	if errors.As(err, &re) {
+		return re.Reason
+	}
+	return ""
+}
+
+// maxErrorBody is how much of an error answer reaches the log: enough for
+// any message ingest writes, short enough that a proxy's HTML page or a
+// hostile endless body is not a log line of its own.
+const maxErrorBody = 200
+
+// cleanBody makes a server's answer safe to log: control characters and
+// invisible format characters replaced, whitespace runs folded, the whole
+// cut to maxErrorBody bytes.
+func cleanBody(b []byte) string {
+	s := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		return r
+	}, strings.ToValidUTF8(string(b), "\ufffd"))
+	s = strings.Join(strings.Fields(text.Clean(s)), " ")
+	return text.Clip(s, maxErrorBody)
 }
 
 // RetryAfter is how long the server asked us to wait, when it did.
@@ -138,8 +222,12 @@ func New(baseURL, token, caFile string, timeout time.Duration, version string) (
 // TokenFingerprint identifies the token without revealing it (first 12
 // hex digits of its SHA-256): the rejected-token marker is keyed on it, so
 // a new token clears the block by itself.
-func (c *Client) TokenFingerprint() string {
-	sum := sha256.Sum256([]byte(c.token))
+func (c *Client) TokenFingerprint() string { return Fingerprint(c.token) }
+
+// Fingerprint is TokenFingerprint for a token at hand — `health` compares
+// it with the rejected-token record without building a client.
+func Fingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:6])
 }
 
@@ -205,17 +293,23 @@ func (c *Client) Send(ctx context.Context, body []byte) (Ack, error) {
 		// Any reason at all means ingest answered (a proxy never sets the
 		// header); today it says token_unknown or plan_forbidden, and a
 		// value added later must not be mistaken for an outage.
-		if strings.TrimSpace(res.Header.Get(ReasonHeader)) == "" {
-			return Ack{}, &StatusError{Code: res.StatusCode, Body: strings.TrimSpace(string(msg))}
+		reason := cleanBody([]byte(strings.TrimSpace(res.Header.Get(ReasonHeader))))
+		if reason == "" {
+			return Ack{}, &StatusError{Code: res.StatusCode, Body: cleanBody(msg)}
 		}
-		// Keep the server's reason: "unknown or revoked token" and "hosts are
+		kind := ErrUnauthorized
+		if reason == PlanForbidden {
+			kind = ErrPlanPaused
+		}
+		// Keep the server's words: "unknown or revoked token" and "hosts are
 		// not included in this plan" call for different fixes.
-		if reason := strings.TrimSpace(string(msg)); reason != "" {
-			return Ack{}, fmt.Errorf("%w: %s", ErrUnauthorized, reason)
-		}
-		return Ack{}, ErrUnauthorized
+		return Ack{}, &RejectError{Kind: kind, Reason: reason, Msg: cleanBody(msg)}
 	default:
-		return Ack{}, &StatusError{Code: res.StatusCode, Body: strings.TrimSpace(string(msg)), RetryAfter: retryAfter(res)}
+		se := &StatusError{Code: res.StatusCode, Body: cleanBody(msg), RetryAfter: retryAfter(res)}
+		if res.StatusCode >= 300 && res.StatusCode < 400 {
+			se.Location = cleanBody([]byte(res.Header.Get("Location")))
+		}
+		return Ack{}, se
 	}
 }
 

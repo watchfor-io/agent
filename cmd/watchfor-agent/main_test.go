@@ -19,6 +19,9 @@ import (
 // not hit the machine the way the program does; the per-test wizards
 // carry a fixed summary instead of collecting one.
 func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == disk.HelperArg { // the test binary as the statfs helper
+		os.Exit(disk.Helper(os.Args[2:]))
+	}
 	fadeAfter = time.Millisecond
 	sampleEvery = time.Millisecond
 	healthProbe = health.Options{

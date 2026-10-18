@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"testing"
 	"time"
 
@@ -94,12 +95,86 @@ func TestSpoolAndReplay(t *testing.T) {
 	}
 
 	sink.fail = nil
+	a.pauseUntil = time.Time{} // the backoff after two failures is TestBackoff's subject
 	a.tick(context.Background())
 	if n, _ := sp.Stats(); n != 0 {
 		t.Errorf("spool not drained: %d left", n)
 	}
-	if len(sink.got) != 3 {
-		t.Errorf("sent %d payloads after recovery, want 3", len(sink.got))
+	// the live batch, then both spooled ones merged into one request
+	if len(sink.got) != 2 || len(sink.got[1].Samples) <= len(sink.got[0].Samples) {
+		t.Errorf("sent %d requests after recovery, want 2 (the live batch, then the spooled two merged)", len(sink.got))
+	}
+}
+
+// While the server keeps failing, the agent asks less and less often —
+// doubling from the interval, capped, jittered — and spools meanwhile;
+// the first success puts it back on every tick.
+func TestBackoff(t *testing.T) {
+	sp, _ := spool.Open(t.TempDir(), 1<<20)
+	sink := &fakeSink{fail: &push.StatusError{Code: 503}}
+	a := newAgent(t, sink, sp)
+	now := time.Unix(1_700_000_000, 0)
+	a.o.Now = func() time.Time { return now }
+	a.jitter = func(d time.Duration) time.Duration { return d } // the ceiling; real jitter halves at most
+
+	var waits []time.Duration
+	for range 10 {
+		before := sink.calls
+		a.tick(context.Background())
+		if sink.calls == before {
+			t.Fatal("ticked inside a pause; the test should have moved past it")
+		}
+		waits = append(waits, a.pauseUntil.Sub(now))
+		if a.pauseUntil.After(now) {
+			// a tick inside the pause spools without asking
+			calls := sink.calls
+			a.tick(context.Background())
+			if sink.calls != calls {
+				t.Fatal("asked the server during a backoff pause")
+			}
+			now = a.pauseUntil
+		}
+	}
+	want := []time.Duration{0, 5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second, 80 * time.Second, 160 * time.Second, backoffCap, backoffCap, backoffCap}
+	for i := range want {
+		if waits[i] != want[i] && !(i == 0 && waits[i] <= 0) {
+			t.Errorf("wait after failure %d = %s, want %s", i+1, waits[i], want[i])
+		}
+	}
+
+	sink.fail = nil
+	a.tick(context.Background())
+	if a.failures != 0 {
+		t.Errorf("failures after a success = %d, want 0", a.failures)
+	}
+
+	// the real jitter stays within [d/2, d]
+	b := newAgent(t, sink, nil)
+	for range 1000 {
+		if j := b.jitter(time.Minute); j < 30*time.Second || j > time.Minute {
+			t.Fatalf("jitter(1m) = %s", j)
+		}
+	}
+}
+
+// The stall guard sees a round that cannot be making progress any more.
+func TestStalled(t *testing.T) {
+	a := newAgent(t, &fakeSink{}, nil)
+	now := time.Unix(1_700_000_000, 0)
+	a.o.Now = func() time.Time { return now }
+	if _, stalled := a.Stalled(now); stalled {
+		t.Error("idle agent reported stalled")
+	}
+	done := a.round()
+	if _, stalled := a.Stalled(now.Add(stallGrace)); stalled {
+		t.Error("a round within its limit reported stalled")
+	}
+	if d, stalled := a.Stalled(now.Add(stallGrace + 2*a.interval + time.Second)); !stalled || d <= stallGrace {
+		t.Errorf("a stuck round = %s, %v; want stalled", d, stalled)
+	}
+	done()
+	if _, stalled := a.Stalled(now.Add(time.Hour)); stalled {
+		t.Error("a finished round reported stalled")
 	}
 }
 
@@ -151,7 +226,7 @@ func TestAcceptedPushClearsRejection(t *testing.T) {
 	a := newAgent(t, &fakeSink{}, nil)
 	a.o.StateDir = t.TempDir()
 	a.o.TokenFingerprint = "fp1"
-	if _, err := RecordRejection(a.o.StateDir, "fp1", time.Now()); err != nil {
+	if _, err := RecordRejection(a.o.StateDir, "fp1", "token_unknown", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.tick(context.Background()); err != nil {
@@ -181,6 +256,37 @@ func TestModuleFailureLoggedOnce(t *testing.T) {
 	a.note("m", nil)
 	if len(a.failing) != 0 {
 		t.Error("recovery should clear the failure")
+	}
+}
+
+// A bad or hostile ingest cannot stretch the cadence past an hour (or
+// overflow it negative); the configured interval stays the floor.
+func TestServerIntervalIsClamped(t *testing.T) {
+	sink := &fakeSink{}
+	a := newAgent(t, sink, nil)
+	cases := []struct {
+		server int
+		want   time.Duration
+	}{
+		{365 * 24 * 3600, time.Hour},
+		{3600, time.Hour},
+		{3601, time.Hour},
+		{math.MaxInt, time.Hour},
+		{-5, a.o.Interval},
+		{0, a.o.Interval},
+		{120, 2 * time.Minute},
+	}
+	for _, c := range cases {
+		sink.interval = c.server
+		if err := a.Once(context.Background(), time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		if a.Interval() != c.want {
+			t.Errorf("server interval %d s: agent uses %s, want %s", c.server, a.Interval(), c.want)
+		}
+	}
+	if got := serverInterval(math.MaxInt); got != time.Hour {
+		t.Errorf("serverInterval(huge) = %s", got)
 	}
 }
 

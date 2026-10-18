@@ -20,31 +20,20 @@ checksum:
   # checksums: watchfor.io serves the copy it verified against them.
   extra_files:
     - glob: ./packaging/install.sh
-# The checksums file is signed with minisign; the public key is in
-# packaging/install.sh and in the README. The secret key lives only in the
-# release workflow's secret (and Vault).
-signs:
-  - id: minisign
-    cmd: minisign
-    artifacts: checksum
-    signature: "${artifact}.minisig"
-    args:
-      - "-S"
-      - "-W"
-      - "-s"
-      - "{{ .Env.MINISIGN_SECRET_KEY_FILE }}"
-      - "-t"
-      - "watchfor-agent {{ .Version }} checksums"
-      - "-x"
-      - "${signature}"
-      - "-m"
-      - "${artifact}"
+# No signs: here on purpose. GoReleaser never sees the signing key: it
+# uploads an unsigned DRAFT, the release workflow reproduces the binaries,
+# a separate job (the only one with the key, behind the release
+# environment's approval) signs the verified checksums.txt with minisign,
+# and the draft is published only after the signature is attached and
+# checked. The public key is in packaging/install.sh, the README and
+# internal/update/minisign.go.
 changelog:
   use: github
   filters:
     exclude: ["^docs:", "^test:", "^ci:"]
 release:
-  draft: false
+  draft: true # published by the workflow's publish job, never by GoReleaser
+  replace_existing_draft: true # a re-run replaces its own stale draft
   name_template: "watchfor-agent {{ .Version }}"
   extra_files:
     - glob: ./packaging/install.sh

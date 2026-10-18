@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -183,6 +184,30 @@ func TestState(t *testing.T) {
 	}
 	if _, _, ok := ReadState(dir); ok {
 		t.Fatal("hint survived ClearState")
+	}
+}
+
+// The audit's L1 repro: a symlink planted at the old fixed temp name and
+// at the hint itself must not let a root-run daemon overwrite the target.
+func TestWriteStateDoesNotFollowSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(t.TempDir(), "root-owned")
+	if err := os.WriteFile(victim, []byte("original\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"." + StateFile + ".tmp", StateFile} {
+		if err := os.Symlink(victim, filepath.Join(dir, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := WriteState(dir, "9.9.9"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(victim); string(b) != "original\n" {
+		t.Fatalf("WriteState wrote through a symlink: %q", b)
+	}
+	if v, _, ok := ReadState(dir); !ok || v != "9.9.9" {
+		t.Fatalf("ReadState = %q, %v", v, ok)
 	}
 }
 
@@ -402,6 +427,76 @@ func TestRunRestartsActiveUnit(t *testing.T) {
 	}
 	if strings.Join(calls, ";") != "is-active --quiet watchfor-agent;restart watchfor-agent" {
 		t.Fatalf("systemctl calls: %v", calls)
+	}
+}
+
+// A service that stopped itself with exit 3 (up to 0.8 that included a
+// plan pause) is started by an upgrade, so the new release can look again;
+// one that is simply stopped is left alone.
+func TestRunStartsAUnitStoppedOverAToken(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   string
+	}{
+		{"3", "is-active --quiet watchfor-agent;show -p ExecMainStatus --value watchfor-agent;is-enabled --quiet watchfor-agent;start watchfor-agent"},
+		{"0", "is-active --quiet watchfor-agent;show -p ExecMainStatus --value watchfor-agent"},
+	} {
+		s := newSigner(t)
+		r := newRelease(t, s, "9.9.9", "#!/bin/sh\necho watchfor-agent 9.9.9\n", nil)
+		o := testOptions(t, r, s, "0.2.0")
+		o.Target, o.Restart = "9.9.9", true
+		var calls []string
+		o.Exec = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			if name == "systemctl" {
+				calls = append(calls, strings.Join(args, " "))
+				switch args[0] {
+				case "is-active":
+					return []byte("inactive\n"), errors.New("exit status 3")
+				case "show":
+					return []byte(tc.status + "\n"), nil
+				}
+				return nil, nil
+			}
+			return execScript(ctx, name, args...)
+		}
+		res, err := Run(context.Background(), o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(calls, ";"); got != tc.want {
+			t.Errorf("exit %s: systemctl calls %q, want %q", tc.status, got, tc.want)
+		}
+		if res.Restarted != (tc.status == "3") {
+			t.Errorf("exit %s: Restarted = %v", tc.status, res.Restarted)
+		}
+	}
+}
+
+// After the swap, the new binary is asked to sync the units, before the
+// restart that brings them into effect.
+func TestRunSyncsUnitsWithTheNewBinary(t *testing.T) {
+	s := newSigner(t)
+	r := newRelease(t, s, "9.9.9", "#!/bin/sh\necho watchfor-agent 9.9.9\n", nil)
+	o := testOptions(t, r, s, "0.2.0")
+	o.Target, o.Restart, o.SyncUnits = "9.9.9", true, true
+	var calls []string
+	o.Exec = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		switch {
+		case name == "systemctl":
+			calls = append(calls, "systemctl "+args[0])
+			return nil, nil
+		case len(args) > 0 && args[0] == "upgrade":
+			calls = append(calls, filepath.Base(name)+" "+strings.Join(args, " "))
+			return nil, nil
+		}
+		return execScript(ctx, name, args...)
+	}
+	if _, err := Run(context.Background(), o); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Base(o.ExePath) + " upgrade -sync-units;systemctl is-active;systemctl restart"
+	if strings.Join(calls, ";") != want {
+		t.Fatalf("calls = %v, want %s", calls, want)
 	}
 }
 

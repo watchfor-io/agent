@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math/rand/v2"
+	"sync/atomic"
 	"time"
 
 	"github.com/watchfor-io/agent/internal/metric"
@@ -45,8 +47,14 @@ type Options struct {
 }
 
 const (
-	factsEvery    = time.Hour
-	replayPerTick = 4 // a burst after an outage must stay under the server's per-host budget
+	factsEvery = time.Hour
+	// backoffCap is the longest the agent waits between attempts while
+	// the server keeps failing; the spool holds the batches meanwhile.
+	backoffCap = 5 * time.Minute
+	// stallGrace is what a round may take beyond two intervals before it
+	// counts as stuck: every module's budget, a push and a replay burst at
+	// their timeouts fit well inside it.
+	stallGrace = 10 * time.Minute
 )
 
 // Agent is one host's collect → encode → send loop, plus the state the
@@ -70,12 +78,44 @@ type Agent struct {
 	// dropNoted is the last dropped count the log was told about, and when.
 	dropNoted   int
 	dropNotedAt time.Time
+
+	// failures counts transient send failures in a row; from the second
+	// one on, the agent waits an exponentially longer, jittered time
+	// before asking again, so thousands of hosts do not hit a recovering
+	// server in lockstep every tick.
+	failures int
+	jitter   func(time.Duration) time.Duration
+
+	// roundStart is when the round in progress began (unix ns, 0 when
+	// idle) and roundLimit how long it may take; both are read by the
+	// stall guard on another goroutine.
+	roundStart atomic.Int64
+	roundLimit atomic.Int64
+
+	// pushState is the last answer recorded in PushStateFile.
+	pushState string
+	// planPauses counts plan_forbidden answers in a row, for their
+	// backoff; pauseDrop says the pause in force is one where batches are
+	// not kept (the plan does not take them).
+	planPauses int
+	pauseDrop  bool
+	// lastSent is whether the last batch sent was accepted, for Once;
+	// deferred says it was kept back on purpose (a pause in force).
+	lastSent bool
+	deferred bool
+
+	self selfUsage // the agent's own CPU time at the last tick
 }
 
 // ErrTokenRejected is returned by Run/Once once the server has rejected
 // the token repeatedly over a span of time: the host was removed in
 // WatchFor or its token was rotated, and the agent should stop.
 var ErrTokenRejected = errors.New("token rejected by the server repeatedly")
+
+// ErrNotAccepted is Once's answer when the batch did not get through: the
+// server was unreachable or refused it. The batch is in the spool when
+// there is one; the exit status tells cron (and whoever reads its mail).
+var ErrNotAccepted = errors.New("the batch was not accepted by the server")
 
 // New prepares an Agent from o, filling in slog's default logger and the
 // real clock when they are left nil.
@@ -86,7 +126,31 @@ func New(o Options) *Agent {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	return &Agent{o: o, interval: o.Interval, failing: map[string]string{}}
+	a := &Agent{o: o, interval: o.Interval, failing: map[string]string{}}
+	a.jitter = func(d time.Duration) time.Duration { return d/2 + rand.N(d/2+1) } // #nosec G404 -- spreading retries, not a secret
+	a.roundLimit.Store(int64(2*o.Interval + stallGrace))
+	return a
+}
+
+// Stalled reports a round that has been running longer than it possibly
+// can when it is making progress — a module stuck in a syscall on a dead
+// NFS mount, a deadlock — and for how long. The daemon's stall guard exits
+// on it so the service manager starts a fresh agent instead of leaving a
+// process that looks alive and sends nothing.
+func (a *Agent) Stalled(now time.Time) (time.Duration, bool) {
+	start := a.roundStart.Load()
+	if start == 0 {
+		return 0, false
+	}
+	running := now.Sub(time.Unix(0, start))
+	return running, running > time.Duration(a.roundLimit.Load())
+}
+
+// round brackets one collect-and-send for Stalled.
+func (a *Agent) round() func() {
+	a.roundLimit.Store(int64(2*a.interval + stallGrace))
+	a.roundStart.Store(a.o.Now().UnixNano())
+	return func() { a.roundStart.Store(0) }
 }
 
 // Interval is the cadence currently in use.
@@ -121,13 +185,29 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
-// applyAck stretches the cadence to the server's minimum. The configured
-// interval stays the floor, so a plan upgrade brings the agent back down
-// without a restart.
+// maxServerInterval caps how far the server may stretch the cadence. No
+// plan asks for more than a few minutes; a bad or hostile answer ("push
+// once a year") must not quietly turn the agent into a silent one.
+const maxServerInterval = time.Hour
+
+// serverInterval is the cadence the server asked for, clamped to
+// 0…maxServerInterval (in seconds first, so a huge value cannot overflow
+// time.Duration into a negative one).
+func serverInterval(seconds int) time.Duration {
+	return time.Duration(min(max(seconds, 0), int(maxServerInterval/time.Second))) * time.Second
+}
+
+// applyAck stretches the cadence to the server's minimum, capped at
+// maxServerInterval. The configured interval stays the floor, so a plan
+// upgrade brings the agent back down without a restart.
 func (a *Agent) applyAck(ack push.Ack) {
-	want := max(a.o.Interval, time.Duration(ack.Interval)*time.Second)
+	want := max(a.o.Interval, serverInterval(ack.Interval))
 	if want == a.interval {
 		return
+	}
+	if ack.Interval > int(maxServerInterval/time.Second) { // said once per change, not per push
+		a.o.Log.Warn("the server asked for a longer interval than the agent allows; using the cap",
+			"asked_s", ack.Interval, "cap", maxServerInterval.String())
 	}
 	if want > a.o.Interval {
 		a.o.Log.Info("interval set by the server", "interval", want.String(), "configured", a.o.Interval.String())
@@ -140,17 +220,38 @@ func (a *Agent) applyAck(ack push.Ack) {
 // Once is the cron mode: rates need two samples, so it collects, waits gap,
 // collects again and sends only the second batch. The priming pass never
 // becomes a payload, so the one batch that is sent carries the facts.
+//
+// A pause the server asked for (Retry-After, a rejected token's backoff, a
+// plan pause, the backoff while it fails) outlives the process: it is
+// read from the state folder at the start and written back at the end,
+// so cron's next run honours it. A run that kept its batch back for such
+// a pause has done what it should and returns nil.
 func (a *Agent) Once(ctx context.Context, gap time.Duration) error {
+	defer a.round()()
+	a.loadPause()
+	defer a.savePause()
 	a.collect(ctx)
+	a.footprint(nil)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(gap):
 	}
-	return a.send(ctx, a.Collect(ctx))
+	if err := a.send(ctx, a.Collect(ctx)); err != nil {
+		return err
+	}
+	switch {
+	case a.lastSent:
+		return nil
+	case a.deferred:
+		a.o.Log.Debug("a pause is in force; the batch waits", "until", a.pauseUntil.Format(time.RFC3339), "dropped", a.pauseDrop)
+		return nil
+	}
+	return ErrNotAccepted
 }
 
 func (a *Agent) tick(ctx context.Context) error {
+	defer a.round()()
 	err := a.send(ctx, a.Collect(ctx))
 	if errors.Is(err, ErrTokenRejected) {
 		return err
@@ -162,33 +263,35 @@ func (a *Agent) tick(ctx context.Context) error {
 // server having a bad minute (its token cache cold, its database away),
 // so the agent records it, spools the batch and waits with backoff; only
 // a rejection that holds across several attempts and minutes is final.
-func (a *Agent) rejected(err error, body []byte) error {
+func (a *Agent) rejected(err error, bodies [][]byte) error {
 	now := a.o.Now()
-	rec, rerr := RecordRejection(a.o.StateDir, a.o.TokenFingerprint, now)
+	reason := push.Reason(err)
+	rec, rerr := RecordRejection(a.o.StateDir, a.o.TokenFingerprint, reason, now)
 	if rerr != nil {
 		a.o.Log.Warn("could not record the rejected token; the stop-after-repeats rule cannot hold", "error", rerr)
 	}
 	if rec.Sticky() {
 		a.o.Log.Error("stopping: the server has rejected this host's token repeatedly",
-			"error", err, "rejections", rec.Count, "since", rec.First.Format(time.RFC3339),
-			"why", "the host was removed in WatchFor or its token was rotated",
+			"error", err, "reason", rec.Reason, "rejections", rec.Count, "since", rec.First.Format(time.RFC3339),
+			"why", rec.Why(),
 			"fix", "put the new token in place and restart, or stop the agent: sudo systemctl disable --now watchfor-agent")
 		return ErrTokenRejected
 	}
 	wait := rec.Backoff()
 	a.pauseUntil = now.Add(wait)
-	if a.o.Spool != nil {
-		_ = a.o.Spool.Put(body)
+	if err := a.keep(bodies); err != nil {
+		a.o.Log.Error("spool refused the batch while the token is rejected", "spool", err)
 	}
 	a.o.Log.Warn("token rejected by the server; will try again",
-		"error", err, "attempt", rec.Count, "of", StickyRejections, "retry_in", wait.String(),
-		"note", "if the host was removed in WatchFor or its token rotated, the agent stops by itself once the rejection has held for over "+StickySpan.String())
+		"error", err, "reason", rec.Reason, "why", rec.Why(), "attempt", rec.Count, "of", StickyRejections, "retry_in", wait.String(),
+		"note", "if the rejection holds for over "+StickySpan.String()+" the agent stops by itself (exit 3)")
 	return nil
 }
 
 // Collect runs every module once and wraps the samples as a payload.
 func (a *Agent) Collect(ctx context.Context) *metric.Payload {
 	b := a.collect(ctx)
+	a.footprint(b)
 	p := &metric.Payload{
 		Version: metric.PayloadVersion,
 		Agent:   a.o.Version,
@@ -235,52 +338,184 @@ func (a *Agent) note(module string, err error) {
 }
 
 func (a *Agent) send(ctx context.Context, p *metric.Payload) error {
-	body, err := push.Encode(p)
+	bodies, err := encodeChunks(p, maxBatchSamples, maxBatchBytes)
 	if err != nil {
 		return err
 	}
+	a.lastSent, a.deferred = false, false
 	if now := a.o.Now(); now.Before(a.pauseUntil) {
-		// Waiting out a token rejection or a Retry-After: keep the batch,
-		// do not ask yet.
-		if a.o.Spool != nil {
-			_ = a.o.Spool.Put(body)
+		// Waiting out a token rejection, a Retry-After or a backoff: keep
+		// the batch, do not ask yet. A plan pause keeps nothing.
+		a.deferred = true
+		if !a.pauseDrop {
+			if err := a.keep(bodies); err != nil {
+				a.o.Log.Error("spool refused the batch while paused", "spool", err)
+			}
 		}
 		return nil
 	}
-	ack, err := a.o.Sink.Send(ctx, body)
-	if err != nil {
+	a.pauseDrop = false
+	accepted, splits := 0, 0
+	for i := 0; i < len(bodies); i++ {
+		body := bodies[i]
+		ack, err := a.o.Sink.Send(ctx, body)
+		if err == nil {
+			accepted++
+			a.noteAccepted(ack, body)
+			continue
+		}
 		switch {
+		case push.TooLarge(err):
+			// Over ingest's per-batch limit: halve it and send the halves.
+			if halves, ok := splitBody(body); ok {
+				a.o.Log.Debug("the server found the batch too large; sending it in halves", "error", err)
+				bodies = append(bodies[:i+1:i+1], append(halves, bodies[i+1:]...)...)
+				splits++
+				continue
+			}
+			a.notePush(PushRefused)
+			a.o.Log.Error("batch dropped: a single sample is over the server's size limit", "error", err)
+			continue
 		case errors.Is(err, push.ErrUnauthorized):
-			return a.rejected(err, body)
-		case push.Retryable(err) && a.o.Spool != nil:
-			if wait := push.RetryAfter(err); wait > 0 {
-				a.pauseUntil = a.o.Now().Add(wait) // the server said when; the spool holds the meantime
-				a.o.Log.Debug("server asked for a pause", "wait", wait)
-			}
-			if serr := a.o.Spool.Put(body); serr != nil {
-				a.o.Log.Error("send failed and spool refused the batch", "error", err, "spool", serr)
-			} else {
-				if ctx.Err() != nil { // shutdown or reload, not the server
-					a.o.Log.Debug("send cut short, batch spooled", "samples", len(p.Samples))
-				} else {
-					a.o.Log.Warn("send failed, batch spooled", "error", err, "samples", len(p.Samples))
-				}
-			}
+			a.notePush(PushTokenRejected)
+			return a.rejected(err, bodies[i:])
+		case errors.Is(err, push.ErrPlanPaused):
+			a.planPaused(err)
+			return nil
+		case push.Retryable(err):
+			a.failed(ctx, err, bodies[i:], len(p.Samples))
+			return nil
 		default:
+			a.notePush(PushRefused)
 			a.o.Log.Error("batch dropped", "error", err, "samples", len(p.Samples))
+			continue
 		}
+	}
+	if accepted == 0 {
 		return nil
 	}
-	a.o.Log.Debug("batch accepted", "samples", len(p.Samples), "bytes", len(body), "facts", p.Facts != nil, "latest_version", ack.LatestVersion)
-	a.noteDropped(ack, len(p.Samples))
-	a.applyAck(ack)
-	a.noteUpdate(ack.LatestVersion)
+	a.lastSent = accepted == len(bodies)-splits
+	a.failures = 0
+	if a.planPauses > 0 {
+		a.planPauses = 0
+		a.o.Log.Info("WatchFor takes this host's batches again")
+	}
+	a.notePush(PushAccepted)
+	a.o.Log.Debug("batch accepted", "samples", len(p.Samples), "requests", len(bodies), "facts", p.Facts != nil)
 	if !a.accepted {
 		a.accepted = true
 		ClearRejected(a.o.StateDir)
 	}
 	a.replay(ctx)
 	return nil
+}
+
+// noteAccepted acts on one accepted request's answer.
+func (a *Agent) noteAccepted(ack push.Ack, body []byte) {
+	a.o.Log.Debug("request accepted", "bytes", len(body), "kept", ack.Accepted, "latest_version", ack.LatestVersion)
+	a.noteDropped(ack, ack.Accepted+ack.Dropped)
+	a.applyAck(ack)
+	a.noteUpdate(ack.LatestVersion)
+}
+
+// failed handles a transient failure: the server's Retry-After, the
+// backoff, and the spool for what was not sent.
+func (a *Agent) failed(ctx context.Context, err error, bodies [][]byte, samples int) {
+	if wait := push.RetryAfter(err); wait > 0 {
+		a.pauseUntil = a.o.Now().Add(wait) // the server said when; the spool holds the meantime
+		a.o.Log.Debug("server asked for a pause", "wait", wait)
+	}
+	if ctx.Err() != nil { // shutdown or reload, not the server
+		if a.keep(bodies) == nil && a.o.Spool != nil {
+			a.o.Log.Debug("send cut short, batch spooled", "samples", samples)
+		}
+		return
+	}
+	a.backoff()
+	a.notePush(PushNoAnswer)
+	if loc, ok := push.Redirect(err); ok {
+		a.o.Log.Warn("the server answered with a redirect, which the agent never follows (the token goes only where agent.yml says); check server.url",
+			"location", loc)
+	}
+	switch serr := a.keep(bodies); {
+	case a.o.Spool == nil:
+		a.o.Log.Warn("send failed; no spool, batch dropped", "error", err, "samples", samples)
+	case serr != nil:
+		a.o.Log.Error("send failed and spool refused the batch", "error", err, "spool", serr)
+	default:
+		a.o.Log.Warn("send failed, batch spooled", "error", err, "samples", samples)
+	}
+}
+
+// keep spools bodies, oldest first; the error is the first Put that
+// failed (nil without a spool: nothing to report there). Batches the
+// spool gave up to make room are said once per call.
+func (a *Agent) keep(bodies [][]byte) error {
+	if a.o.Spool == nil {
+		return nil
+	}
+	var first error
+	for _, b := range bodies {
+		if err := a.o.Spool.Put(b); err != nil && first == nil {
+			first = err
+		}
+	}
+	if n := a.o.Spool.TakeDropped(); n > 0 {
+		a.o.Log.Warn("spool full: dropped the oldest batches to keep the newest", "dropped", n)
+	}
+	return first
+}
+
+// backoff counts a transient failure and, from the second in a row,
+// pauses sending: the interval doubled per failure, capped at backoffCap,
+// jittered down to half so the hosts that lost the server together do
+// not come back together. A longer Retry-After the server sent stands.
+func (a *Agent) backoff() {
+	a.failures++
+	if a.failures < 2 || a.interval <= 0 {
+		return
+	}
+	wait := backoffCap
+	if shift := a.failures - 2; shift < 16 {
+		wait = min(a.interval<<shift, backoffCap)
+	}
+	wait = a.jitter(wait)
+	if until := a.o.Now().Add(wait); until.After(a.pauseUntil) {
+		a.pauseUntil = until
+		a.o.Log.Debug("server unavailable; backing off", "failures", a.failures, "wait", wait.String())
+	}
+}
+
+// planPaused handles ingest's plan_forbidden: the token is valid (so any
+// rejected-token record is stale), the plan does not take this host now.
+// WatchFor restores paused hosts by itself when the limit allows, so the
+// agent never gives up: it asks again after 1, 5, 15, then every 30
+// minutes, jittered, and drops the batches meanwhile — a plan that does
+// not take the host would not take its backlog either.
+func (a *Agent) planPaused(err error) {
+	a.planPauses++
+	if a.planPauses == 1 {
+		ClearRejected(a.o.StateDir)
+	}
+	a.notePush(PushPlanPaused)
+	wait := 30 * time.Minute
+	switch a.planPauses {
+	case 1:
+		wait = time.Minute
+	case 2:
+		wait = 5 * time.Minute
+	case 3:
+		wait = 15 * time.Minute
+	}
+	wait = a.jitter(wait)
+	a.pauseUntil, a.pauseDrop = a.o.Now().Add(wait), true
+	log := a.o.Log.Debug
+	if a.planPauses == 1 || a.planPauses%48 == 0 { // once, then about once a day
+		log = a.o.Log.Warn
+	}
+	log("WatchFor paused this host: the plan does not include server monitoring, or the organization is over its host limit",
+		"error", err, "retry_in", wait.Round(time.Second).String(),
+		"fix", "raise the plan or remove another host in WatchFor; the agent picks up by itself, no restart needed")
 }
 
 // noteUpdate acts on the server's "latest release" hint: one warning per
@@ -319,33 +554,114 @@ func (a *Agent) noteUpdate(latest string) {
 	}
 }
 
+// replay sends spooled batches after a successful push: as many requests
+// as the server's per-host budget leaves (replayBudget), each one merging
+// consecutive spooled batches up to the per-request limits — a day of
+// one-minute batches goes in a few minutes, not in hours.
 func (a *Agent) replay(ctx context.Context) {
 	if a.o.Spool == nil {
 		return
 	}
-	for i := 0; i < replayPerTick; i++ {
-		name, body, err := a.o.Spool.Next()
+	single := false // after a merged request was refused, one batch at a time
+	for range a.replayBudget() {
+		names, body := a.nextReplay(single)
+		if len(names) == 0 {
+			return
+		}
+		_, err := a.o.Sink.Send(ctx, body)
+		switch {
+		case err == nil:
+			for _, n := range names {
+				a.forget(n)
+			}
+		case errors.Is(err, push.ErrUnauthorized) || errors.Is(err, push.ErrPlanPaused):
+			return // the token or the plan is the problem, not this batch; the next tick decides
+		case push.TooLarge(err) && len(names) > 1:
+			single = true
+		case push.TooLarge(err):
+			a.splitSpooled(names[0], body)
+		case push.Retryable(err):
+			return
+		case len(names) > 1:
+			single = true // find the batch the server objects to
+		default:
+			a.o.Log.Error("spooled batch dropped", "error", err)
+			a.forget(names[0])
+		}
+	}
+}
+
+// nextReplay reads the oldest spooled batches and merges those that fit
+// one request (same host, at most maxBatchSamples samples and about
+// maxBatchBytes). A single batch goes out byte for byte as it was spooled.
+// Unreadable or corrupt files are dropped on the way; a batch over the
+// limits by itself (spooled by an older release) is split in place first.
+func (a *Agent) nextReplay(single bool) (names []string, body []byte) {
+	var merged *metric.Payload
+	var first []byte
+	size := 0
+	for _, n := range a.o.Spool.Oldest(replayScan) {
+		b, err := a.o.Spool.Read(n)
 		if err != nil {
-			if name != "" {
-				a.o.Log.Warn("spooled batch unreadable; dropped", "file", name, "error", err)
-				a.forget(name)
-			}
-			return
+			a.o.Log.Warn("spooled batch unreadable; dropped", "file", n, "error", err)
+			a.forget(n)
+			continue
 		}
-		if name == "" {
-			return
+		p, err := push.Decode(b)
+		if err != nil {
+			a.o.Log.Warn("spooled batch is not a batch; dropped", "file", n, "error", err)
+			a.forget(n)
+			continue
 		}
-		if _, err := a.o.Sink.Send(ctx, body); err != nil {
-			if errors.Is(err, push.ErrUnauthorized) {
-				return // the token is the problem, not this batch; tick() decides what happens next
+		if merged == nil {
+			if len(p.Samples) > maxBatchSamples || len(b) > maxBatchBytes {
+				if parts, err := encodeChunks(p, maxBatchSamples, maxBatchBytes); err == nil && len(parts) > 1 {
+					if err := a.o.Spool.Split(n, parts); err == nil {
+						return a.nextReplay(single)
+					}
+				}
+				return []string{n}, b
 			}
-			if !push.Retryable(err) {
-				a.o.Log.Error("spooled batch dropped", "error", err)
-				a.forget(name)
-				continue
+			if single {
+				return []string{n}, b
 			}
-			return
+			merged, first, size = p, b, len(b)
+			names = append(names, n)
+			continue
 		}
+		if p.Host.ID != merged.Host.ID || p.Host.Name != merged.Host.Name ||
+			len(merged.Samples)+len(p.Samples) > maxBatchSamples || size+len(b) > maxBatchBytes {
+			break
+		}
+		merged.Samples = append(merged.Samples, p.Samples...)
+		merged.Agent, merged.Host = p.Agent, p.Host
+		if p.Facts != nil {
+			merged.Facts = p.Facts
+		}
+		size += len(b)
+		names = append(names, n)
+	}
+	if len(names) <= 1 {
+		return names, first
+	}
+	body, err := push.Encode(merged)
+	if err != nil {
+		return names[:1], first
+	}
+	return names, body
+}
+
+// splitSpooled replaces a spooled batch the server found too large with
+// its two halves, in place; one that cannot be split is dropped.
+func (a *Agent) splitSpooled(name string, body []byte) {
+	halves, ok := splitBody(body)
+	if !ok {
+		a.o.Log.Error("spooled batch dropped: a single sample is over the server's size limit", "file", name)
+		a.forget(name)
+		return
+	}
+	if err := a.o.Spool.Split(name, halves); err != nil {
+		a.o.Log.Warn("could not split a spooled batch the server found too large; dropped", "file", name, "error", err)
 		a.forget(name)
 	}
 }

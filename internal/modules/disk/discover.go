@@ -3,12 +3,13 @@
 package disk
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
+	"time"
 
 	"github.com/watchfor-io/agent/internal/procfs"
 	"gopkg.in/yaml.v3"
@@ -41,6 +42,10 @@ type Disk struct {
 	Spans []string
 }
 
+// discoverBudget bounds the whole statfs pass of Discover: enough for a
+// few rounds of statfsTimeout when several mounts hang at once.
+const discoverBudget = 10 * time.Second
+
 // Discover lists the mounts and whole disks an unconfigured module watches
 // — what `config init` and `config detect` show the operator to pick from.
 func Discover() (mounts []Discovered, devices []string, err error) {
@@ -48,20 +53,35 @@ func Discover() (mounts []Discovered, devices []string, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	m := mod.(*module)
+	return mod.(*module).discover()
+}
+
+func (m *module) discover() (mounts []Discovered, devices []string, err error) {
 	all, err := procfs.ReadMounts()
 	if err != nil {
 		return nil, nil, err
 	}
-	seen := map[string]bool{}
+	var want []procfs.Mount
 	for _, mt := range all {
-		if !m.wantMount(mt) || seen[mt.Device] {
+		if m.wantMount(mt) {
+			want = append(want, mt)
+		}
+	}
+	// The same guard as a collection tick: a hard NFS/CIFS mount whose
+	// server is gone blocks statfs in the kernel for ever, and `config
+	// init` runs inside the installer — it must list the other disks and
+	// finish, not hang the install. A mount that does not answer within
+	// statfsTimeout is left out, like one that cannot be read.
+	ctx, cancel := context.WithTimeout(context.Background(), discoverBudget)
+	defer cancel()
+	results := m.stat.statAll(ctx, want)
+	seen := map[string]bool{}
+	for i, mt := range want {
+		r := results[i]
+		if r.err != nil || seen[mt.Device] {
 			continue
 		}
-		var st syscall.Statfs_t
-		if err := syscall.Statfs(mt.Point, &st); err != nil {
-			continue
-		}
+		st := r.st
 		bs := uint64(max(st.Frsize, 0)) // int64 in the kernel's struct, never negative
 		if bs == 0 {
 			bs = uint64(max(st.Bsize, 0))

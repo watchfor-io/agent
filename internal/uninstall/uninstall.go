@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/watchfor-io/agent/internal/config"
@@ -223,14 +224,29 @@ func Run(ctx context.Context, o Options) error {
 	}
 	rmFile("lock", p.Lock)
 	if userExists(ctx, o) {
-		if err := run("userdel", o.User); err != nil {
-			errs = append(errs, fmt.Errorf("userdel %s: %w", o.User, err))
+		// Plain userdel, never -f: it refuses while a process still runs as
+		// the account, and when that process is not the agent (another
+		// service sharing the uid) forcing it would leave the process with a
+		// uid that has no name — free for the next useradd to hand out,
+		// which is how a uid gets shared in the first place. The account
+		// stays, the failure is said, the exit status is non-zero.
+		if out, err := o.Exec(ctx, "userdel", o.User); err != nil {
+			msg := strings.TrimSpace(string(out))
+			if msg == "" {
+				msg = err.Error()
+			}
+			say("kept system user %s: userdel refused (%s)", o.User, msg)
+			errs = append(errs, fmt.Errorf("userdel %s: %s — the account stays; see which processes still run as it with: ps -o pid,user,comm -u %s", o.User, msg, o.User))
 		} else {
 			say("removed system user %s", o.User)
+			_ = run("groupdel", o.User) // already gone when it was the user's private group
 		}
-		_ = run("groupdel", o.User) // already gone when it was the user's private group
 		if o.KeepConfig && p.ConfigDir != "" {
-			// a kept config must not belong to a uid that no longer exists
+			// A kept config must not belong to a uid that no longer exists:
+			// the next useradd (any service's) may get that uid and with it
+			// the token. Root keeps it instead; install.sh hands the token
+			// back to the service account it creates on a reinstall, and
+			// checks that the service then stays up.
 			// #nosec G122 -- Lchown acts on the link itself, never its target,
 			// so a planted symlink cannot redirect the chown out of the tree.
 			_ = filepath.WalkDir(p.ConfigDir, func(path string, _ os.DirEntry, err error) error {
@@ -239,6 +255,7 @@ func Run(ctx context.Context, o Options) error {
 				}
 				return nil
 			})
+			say("handed %s to root (its account is gone); the installer gives the token back to the new account", p.ConfigDir)
 		}
 	}
 	// The binary last: on Linux an unlinked executable keeps running.

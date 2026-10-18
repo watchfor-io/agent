@@ -6,9 +6,11 @@ package disk
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"regexp"
+	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -68,6 +70,7 @@ type module struct {
 	ignore map[string]bool
 	prev   map[string]procfs.DiskStat
 	prevAt time.Time
+	stat   *statfser
 }
 
 func init() { modules.Register("disk", New) }
@@ -75,7 +78,7 @@ func init() { modules.Register("disk", New) }
 // New is the disk module's factory: it decodes the section and folds the
 // configured ignore_fs into the built-in pseudo-filesystem list.
 func New(node *yaml.Node) (modules.Module, error) {
-	m := &module{ignore: make(map[string]bool, len(pseudoFS))}
+	m := &module{ignore: make(map[string]bool, len(pseudoFS)), stat: newStatfser()}
 	if err := modules.Decode(node, &m.cfg); err != nil {
 		return nil, err
 	}
@@ -93,14 +96,19 @@ func (m *module) Name() string { return "disk" }
 
 // Collect adds usage per mount and, unless io is off, I/O rates per
 // whole disk. The first tick only primes the rates.
+//
+// A mount that does not answer (a hard NFS/CIFS mount whose server is
+// gone) costs one tick at most statfsTimeout and is then skipped until it
+// answers again; the rest of the disks, and I/O rates, are still reported,
+// and the module's error names the mount.
 func (m *module) Collect(ctx context.Context, b *metric.Batch) error {
-	if err := m.usage(ctx, b); err != nil {
-		return err
-	}
+	uerr := m.usage(ctx, b)
 	if m.cfg.IO == nil || *m.cfg.IO {
-		return m.io(b)
+		if err := m.io(b); err != nil {
+			return errors.Join(uerr, err)
+		}
 	}
-	return nil
+	return uerr
 }
 
 func (m *module) usage(ctx context.Context, b *metric.Batch) error {
@@ -108,18 +116,25 @@ func (m *module) usage(ctx context.Context, b *metric.Batch) error {
 	if err != nil {
 		return err
 	}
-	seen := make(map[string]bool, len(mounts))
+	var want []procfs.Mount
 	for _, mt := range mounts {
-		if ctx.Err() != nil {
-			return ctx.Err() // a mount that hung took the whole budget
+		if m.wantMount(mt) {
+			want = append(want, mt)
 		}
-		if !m.wantMount(mt) || seen[mt.Device] {
+	}
+	results := m.stat.statAll(ctx, want)
+	seen := make(map[string]bool, len(want))
+	var hung []string
+	for i, mt := range want {
+		r := results[i]
+		if errors.Is(r.err, errHung) {
+			hung = append(hung, mt.Point)
 			continue
 		}
-		var st syscall.Statfs_t
-		if err := syscall.Statfs(mt.Point, &st); err != nil {
+		if r.err != nil || seen[mt.Device] {
 			continue // unreachable network mount, or a path we may not enter
 		}
+		st := r.st
 		bs := uint64(max(st.Frsize, 0)) // int64 in the kernel's struct, never negative
 		if bs == 0 {
 			bs = uint64(max(st.Bsize, 0))
@@ -140,6 +155,13 @@ func (m *module) usage(ctx context.Context, b *metric.Batch) error {
 		if st.Files > 0 {
 			b.Add("disk.inodes_used_pct", procfs.Pct(st.Files-st.Ffree, st.Files), l)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err // the budget ran out before every mount was asked
+	}
+	if len(hung) > 0 {
+		sort.Strings(hung)
+		return fmt.Errorf("mount not answering, skipped until it does (hung network filesystem?): %s", strings.Join(hung, ", "))
 	}
 	return nil
 }

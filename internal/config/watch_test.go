@@ -108,3 +108,49 @@ func TestRestoringAfterARejectedEditIsNoChange(t *testing.T) {
 	case <-time.After(3*WatchInterval + 200*time.Millisecond):
 	}
 }
+
+// A rotated token in token_file restarts the daemon on it; touching the
+// file, or emptying it mid-edit, does not.
+func TestWatchTokenReloadsOnNewToken(t *testing.T) {
+	old := WatchInterval
+	WatchInterval = 40 * time.Millisecond
+	t.Cleanup(func() { WatchInterval = old })
+	p := filepath.Join(t.TempDir(), "token")
+	stamp := time.Now()
+	write := func(s string) {
+		t.Helper()
+		if err := os.WriteFile(p, []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stamp = stamp.Add(2 * time.Second)
+		if err := os.Chtimes(p, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("wfh_old\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- WatchToken(ctx, p) }()
+	time.Sleep(80 * time.Millisecond)
+	tick := func() { time.Sleep(WatchInterval + 100*time.Millisecond) }
+
+	write("wfh_old\n") // touched
+	tick()
+	write("") // emptied mid-edit
+	tick()
+	select {
+	case err := <-done:
+		t.Fatalf("reloaded on a touch or an empty file: %v", err)
+	default:
+	}
+	write("wfh_new\n")
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrReload) {
+			t.Fatalf("new token: %v, want ErrReload", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a new token was not noticed")
+	}
+}

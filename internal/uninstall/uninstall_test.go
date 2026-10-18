@@ -15,6 +15,7 @@ import (
 type fakeExec struct {
 	calls   []string
 	hasUser bool
+	busy    bool // userdel refuses: a process still runs as the account
 }
 
 func (f *fakeExec) run(_ context.Context, name string, args ...string) ([]byte, error) {
@@ -23,6 +24,9 @@ func (f *fakeExec) run(_ context.Context, name string, args ...string) ([]byte, 
 		return nil, errors.New("no such user")
 	}
 	if name == "userdel" {
+		if f.busy {
+			return []byte("userdel: user watchfor-agent is currently used by process 4242"), errors.New("exit status 8")
+		}
 		f.hasUser = false
 	}
 	return nil, nil
@@ -139,5 +143,29 @@ func TestSafeDir(t *testing.T) {
 		if got := safeDir(path); got != want {
 			t.Errorf("safeDir(%q) = %v, want %v", path, got, want)
 		}
+	}
+}
+
+// userdel refusing (a process still runs as the account) is a failure
+// said in so many words, the account kept and no -f used.
+func TestUserdelRefusalIsReported(t *testing.T) {
+	root := t.TempDir()
+	o := install(t, root, filepath.Join(root, "var", "lib", "watchfor-agent"))
+	fx := &fakeExec{hasUser: true, busy: true}
+	var out bytes.Buffer
+	o.Exec, o.Out = fx.run, &out
+	err := Run(context.Background(), o)
+	if err == nil || !strings.Contains(err.Error(), "currently used by process 4242") {
+		t.Fatalf("Run = %v, want the userdel refusal", err)
+	}
+	if !strings.Contains(out.String(), "kept system user watchfor-agent") {
+		t.Errorf("output does not say the account stays:\n%s", out.String())
+	}
+	joined := strings.Join(fx.calls, "\n")
+	if strings.Contains(joined, "userdel -f") || strings.Contains(joined, "groupdel") {
+		t.Errorf("forced or removed the group anyway:\n%s", joined)
+	}
+	if _, err := os.Stat(o.ExePath); !errors.Is(err, os.ErrNotExist) {
+		t.Error("the rest of the uninstall stopped at userdel")
 	}
 }

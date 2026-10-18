@@ -9,7 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/user"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,7 +46,13 @@ func (w Watch) label() string {
 
 const (
 	defaultTop = 10
-	cmdlineCap = 256
+	// cmdlineCap is what a command line shown or sent may be (config
+	// detect's examples); cmdlineMatchCap is how much of it a cmdline:
+	// watch is matched against — a JVM's main class comes after a long
+	// classpath, well past the first 256 bytes. Only the configured
+	// string is ever sent, as the watch label.
+	cmdlineCap      = 256
+	cmdlineMatchCap = 4096
 )
 
 type cpuKey struct {
@@ -59,7 +65,7 @@ type module struct {
 	top     int
 	prev    map[int]cpuKey
 	prevAt  time.Time
-	users   map[int]string
+	own     *owners
 	cmdline bool // any watch matches on cmdline
 }
 
@@ -68,7 +74,7 @@ func init() { modules.Register("processes", New) }
 // New is the processes module's factory: it decodes the section, bounds
 // top to 0–100 and insists every watch names something to match.
 func New(node *yaml.Node) (modules.Module, error) {
-	m := &module{top: defaultTop, users: map[int]string{}}
+	m := &module{top: defaultTop, own: newOwners()}
 	if err := modules.Decode(node, &m.cfg); err != nil {
 		return nil, err
 	}
@@ -109,6 +115,10 @@ func (m *module) Collect(_ context.Context, b *metric.Batch) error {
 	elapsed := now.Sub(m.prevAt).Seconds()
 	next := make(map[int]cpuKey, len(pids))
 	entries := make([]entry, 0, len(pids))
+	var buf []byte
+	if m.cmdline {
+		buf = make([]byte, cmdlineMatchCap)
+	}
 	var total, running, sleeping, blocked, zombie, stopped, threads int
 
 	for _, pid := range pids {
@@ -137,11 +147,12 @@ func (m *module) Collect(_ context.Context, b *metric.Batch) error {
 		}
 		next[pid] = cpuKey{ticks: p.CPUTicks(), start: p.StartTicks}
 		if m.cmdline {
-			e.cmdline = procfs.Cmdline(pid, cmdlineCap)
+			e.cmdline = procfs.CmdlineRaw(pid, buf)
 		}
 		entries = append(entries, e)
 	}
 	m.prev, m.prevAt = next, now
+	m.own.forget(next)
 
 	b.Add("proc.total", float64(total))
 	b.Add("proc.running", float64(running))
@@ -225,27 +236,25 @@ func (m *module) matches(w Watch, e entry) bool {
 	if w.Cmdline != "" && !strings.Contains(e.cmdline, w.Cmdline) {
 		return false
 	}
-	if w.User != "" && m.userName(e.p.UID) != w.User {
+	if w.User != "" && m.own.user(e.p) != w.User {
 		return false
 	}
 	return true
 }
 
+// labels name a top consumer: pid, name and user, plus container when it
+// runs in one — there the user is the bare uid, since the host's account
+// name for that number belongs to someone else — and self="true" on the
+// agent's own process, so the dashboard can tell it apart.
 func (m *module) labels(p procfs.Process) metric.Labels {
-	return metric.Labels{"pid": strconv.Itoa(p.PID), "name": p.Comm, "user": m.userName(p.UID)}
+	l := metric.Labels{"pid": strconv.Itoa(p.PID), "name": p.Comm, "user": m.own.user(p)}
+	if c := m.own.container(p); c != "" {
+		l["container"] = c
+	}
+	if p.PID == selfPID {
+		l["self"] = "true"
+	}
+	return l
 }
 
-func (m *module) userName(uid int) string {
-	if uid < 0 {
-		return ""
-	}
-	if name, ok := m.users[uid]; ok {
-		return name
-	}
-	name := strconv.Itoa(uid)
-	if u, err := user.LookupId(name); err == nil {
-		name = procfs.Clean(u.Username)
-	}
-	m.users[uid] = name
-	return name
-}
+var selfPID = os.Getpid()

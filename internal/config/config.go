@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -206,7 +207,11 @@ func (c *Config) resolveToken() error {
 		if v == "" {
 			return fmt.Errorf("server.token: environment variable %s is empty", env)
 		}
-		s.Token = v
+		tok, err := oneToken(v)
+		if err != nil {
+			return fmt.Errorf("server.token: environment variable %s %w", env, err)
+		}
+		s.Token = tok
 	}
 	if s.TokenFile != "" {
 		tok, err := readSecretFile(s.TokenFile)
@@ -219,19 +224,121 @@ func (c *Config) resolveToken() error {
 	return nil
 }
 
+// maxTokenFile caps a token file read: a token is one short line.
+const maxTokenFile = 4 << 10
+
+// readSecretFile reads the token file: a plain file (a symlink to one is
+// fine — Kubernetes mounts secrets that way), private to its owner, read
+// without blocking — a FIFO or device in its place is refused at once
+// instead of hanging the agent — and holding exactly one token.
 func readSecretFile(path string) (string, error) {
-	info, err := os.Stat(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a plain file (%s)", path, info.Mode().Type())
 	}
 	if info.Mode().Perm()&0o077 != 0 {
 		return "", fmt.Errorf("%s is readable by other users (mode %04o); chmod 600 it", path, info.Mode().Perm())
 	}
-	b, err := os.ReadFile(path)
+	if info.Size() > maxTokenFile {
+		return "", fmt.Errorf("%s is %d bytes; a token file holds one token", path, info.Size())
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxTokenFile+1))
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(b)), nil
+	tok, err := oneToken(string(b))
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", path, err)
+	}
+	return tok, nil
+}
+
+// oneToken checks what a token source holds: one line (blank lines
+// around it are fine), and only characters an HTTP header may carry — a
+// second line or a stray control character used to reach the request as
+// an invalid Authorization header, failing every push as if the network
+// were down and filling the spool.
+func oneToken(s string) (string, error) {
+	var lines []string
+	for _, l := range strings.Split(s, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	switch {
+	case len(lines) == 0:
+		return "", nil
+	case len(lines) > 1:
+		return "", fmt.Errorf("holds %d lines; the token is a single line", len(lines))
+	}
+	for _, r := range lines[0] {
+		if r < 0x21 || r > 0x7e {
+			return "", errors.New("holds a character a token cannot have (spaces, control characters and non-ASCII are not allowed)")
+		}
+	}
+	return lines[0], nil
+}
+
+// CheckOwnership refuses, for the commands that send (run, once), an
+// agent.yml, token file or token folder that another local user could
+// change: whoever can write agent.yml can point server.url at their own
+// server and receive the token with the next push, and whoever can write
+// the token folder can swap the token. Group- or world-writable is refused
+// (a folder with the sticky bit, like /tmp, is fine: nobody can replace
+// another's file there).
+func (c *Config) CheckOwnership(configPath string) error {
+	if err := notWritableByOthers(configPath, "agent.yml", "sudo chmod 0644 "+configPath+" && sudo chown root:root "+configPath); err != nil {
+		return err
+	}
+	if err := folderNotWritable(configPath); err != nil {
+		return err
+	}
+	if c.Server.TokenFile != "" {
+		// the file's own mode is checked when it is read (0600)
+		if err := folderNotWritable(c.Server.TokenFile); err != nil {
+			return fmt.Errorf("server.token_file: %w", err)
+		}
+	}
+	return nil
+}
+
+func notWritableByOthers(path, what, fix string) error {
+	st, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if st.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s %s is writable by other users (mode %04o): anyone who can change it can point server.url at another server and receive the token — fix: %s",
+			what, path, st.Mode().Perm(), fix)
+	}
+	return nil
+}
+
+// folderNotWritable checks the folder path is in, and — when path is a
+// symlink — the folder of what it points at.
+func folderNotWritable(path string) error {
+	dirs := []string{filepath.Dir(path)}
+	if real, err := filepath.EvalSymlinks(path); err == nil && filepath.Dir(real) != dirs[0] {
+		dirs = append(dirs, filepath.Dir(real))
+	}
+	for _, d := range dirs {
+		st, err := os.Stat(d)
+		if err != nil {
+			return err
+		}
+		if st.Mode().Perm()&0o022 != 0 && st.Mode()&os.ModeSticky == 0 {
+			return fmt.Errorf("the folder %s is writable by other users (mode %04o), so the file in it can be replaced — fix: sudo chmod go-w %s", d, st.Mode().Perm(), d)
+		}
+	}
+	return nil
 }
 
 func (c *Config) validate() error {

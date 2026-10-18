@@ -25,7 +25,19 @@ type Config struct {
 	Ignore     []string `yaml:"ignore"`
 }
 
-var defaultIgnore = []string{"lo", "veth*", "docker*", "br-*", "virbr*"}
+// DefaultIgnore is what an unconfigured module leaves out: loopback and
+// the per-container / per-VM plumbing that comes and goes with the
+// workloads — Docker and Podman (veth, docker, br-), libvirt (virbr, vnet),
+// and the Kubernetes CNIs: Calico (cali*, vxlan.calico, tunl*), Flannel,
+// generic CNI bridges, kube-proxy's IPVS dummy, Cilium and LXC/LXD (lxc*),
+// Weave. A Kubernetes node has one cali*/lxc* interface per pod; counting
+// them made a busy node's batch too big for the server.
+var DefaultIgnore = []string{
+	"lo", "veth*", "docker*", "br-*", "virbr*", "vnet*",
+	"cali*", "vxlan.calico", "vxlan-v6.calico", "tunl*",
+	"flannel*", "cni*", "kube-ipvs*", "kube-bridge",
+	"cilium_*", "lxc*", "weave", "vethwe*", "datapath",
+}
 
 type module struct {
 	cfg    Config
@@ -43,7 +55,7 @@ func New(node *yaml.Node) (modules.Module, error) {
 		return nil, err
 	}
 	if m.cfg.Ignore == nil {
-		m.cfg.Ignore = defaultIgnore
+		m.cfg.Ignore = DefaultIgnore
 	}
 	for _, g := range m.cfg.Ignore {
 		if _, err := path.Match(g, ""); err != nil {

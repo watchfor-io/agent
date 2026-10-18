@@ -27,6 +27,28 @@ curl --proto '=https' --tlsv1.2 -fsSL https://watchfor.io/agent/install.sh | sud
 The script downloads the release for your architecture, verifies it,
 creates the unprivileged `watchfor-agent` user, writes the token to
 `/etc/watchfor-agent/token` with mode 0600 and enables the systemd unit.
+Re-running it with a new `--token` puts the token in place and restarts
+the agent on it; a leftover `/etc/cron.d/watchfor-agent` is removed, since
+the service now runs the agent. It reports success only once the service
+has stayed up for a few seconds — an agent that exits at once (a token it
+cannot read, an `agent.yml` it refuses) makes the installer fail with the
+service's last log lines instead of printing "running". A token file kept
+from an earlier install (`--uninstall --keep-config` hands what it keeps to
+root) is given back to the service account.
+
+The account gets the first uid in **60578–61183** that no account, no
+group and no running process has. systemd documents that band as unused:
+above `UID_MAX` (60000), so not a person; below systemd's DynamicUser
+range and the 100000+ where rootless containers' subuids start. Container
+images take their users from the other end — 999 and 998 from
+`useradd --system`, 100–110 from `adduser --system`, 1000/1001 — and a
+container without a user namespace runs them as those same numbers on the
+host. A plain `useradd --system` counts down from 999 too, which is how
+an older install could end up sharing its uid with, say, a mail server's
+SOGo in a container: `ps` then names that container's processes
+`watchfor-agent`, and to the kernel they are one user. An existing
+account keeps its uid; `watchfor-agent health` says when it is shared and
+`sudo watchfor-agent health -fix` moves it (see *The screen*).
 The host token comes from the WatchFor dashboard, one per host.
 
 It needs no packages for the verification. The tarball comes from GitHub
@@ -102,7 +124,9 @@ No script, no surprises — four steps:
 ```sh
 tar -xzf watchfor-agent_<version>_linux_amd64.tar.gz
 sudo install -m 0755 watchfor-agent /usr/local/bin/watchfor-agent
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin --user-group watchfor-agent
+getent passwd 60578; getent group 60578; ps -o pid= -u 60578   # nothing printed: free (else try 60579 …, up to 61183 — see Install)
+sudo groupadd --system --gid 60578 watchfor-agent
+sudo useradd --system --uid 60578 --gid watchfor-agent --no-create-home --shell /usr/sbin/nologin watchfor-agent
 sudo install -d -m 0750 -o root -g watchfor-agent /etc/watchfor-agent
 sudo install -d -m 0700 -o watchfor-agent -g watchfor-agent /var/lib/watchfor-agent
 ```
@@ -132,13 +156,33 @@ journalctl -u watchfor-agent -f
 ### From cron (no daemon)
 
 `once` collects, pushes one batch and exits. Cron's floor is a minute; the
-shortest interval your plan allows applies on top of that.
+shortest interval your plan allows applies on top of that. A run never
+takes longer than 40 seconds (collection, push and spool catch-up
+included; at 55 it is ended outright), only one agent runs per state
+folder (`/var/lib/watchfor-agent/agent.lock`), so a run that hangs on a
+dead network cannot pile up behind it, and it exits 1 when the batch was
+not accepted. A dead hard mount (NFS, SMB, FUSE) cannot hold a run either:
+`once` asks the filesystems through a helper process and leaves a helper
+that does not answer behind; the mount is remembered in
+`/var/lib/watchfor-agent/hung-mounts` and not asked again while that
+helper is stuck. With the systemd service installed as well, the cron run
+steps aside — but keep one of the two; `health` points it out.
+
+What the server asked for outlives the run: a `Retry-After`, the backoff
+after a rejected token or while the server fails, and a plan pause are
+kept in `/var/lib/watchfor-agent/pause-state`, so the next minute's run
+waits (its batch goes to the spool) instead of asking again; such a run
+exits 0. At the default `log.level: info` a run that went well prints
+nothing; warnings and errors still do. The cron file sets `MAILTO=""`, so
+cron does not mail them every minute — `sudo watchfor-agent health` shows
+the last push's answer.
 
 ```sh
 sudo cp packaging/watchfor-agent.cron /etc/cron.d/watchfor-agent
 ```
 
 ```cron
+MAILTO=""
 * * * * * watchfor-agent /usr/local/bin/watchfor-agent once -config /etc/watchfor-agent/agent.yml
 ```
 
@@ -159,6 +203,12 @@ state directory, the config directory (the token file is overwritten before
 it is deleted), the `watchfor-agent` system user and the binary. Only
 directories called `watchfor-agent` are removed recursively: a `spool.dir`
 under another name is reported and left to you.
+
+With `-keep-config` the kept folder, token included, is handed to root:
+the account it belonged to is deleted, and its uid may go to the next
+account created on the machine, which would then own the token. Running
+the installer again creates the account and gives the token back to it
+(and checks that the service then stays up).
 
 Remove the host in the dashboard as well; that revokes the token and deletes
 its history.
@@ -184,7 +234,10 @@ release hosts are accepted, redirects included), verifies `checksums.txt`
 against the release key built into the binary —
 the same key as above — checks the archive's sha256 against that signed
 file, runs the new binary once to confirm it reports the expected version,
-swaps it in with an atomic rename and restarts the service. It refuses to
+swaps it in with an atomic rename, lets the new binary bring the service
+unit and cron file up to its release (only where they are an earlier
+release's, byte for byte — an edited unit is left alone and `health` says
+so; changes belong in a drop-in) and restarts the service. It refuses to
 downgrade unless told so (`-allow-downgrade`), and nothing is replaced
 unless every check passed. Re-running the install script does the same
 job with the same checks and keeps the token and `agent.yml`.
@@ -277,13 +330,40 @@ Long lists — mounts, interfaces, processes — filter as you type after
 `/`.
 
 **Health check** answers, without a shell, what someone would otherwise
-check by hand: is `agent.yml` there and does it parse, is the binary
-writable by others, does the service user exist, is the token file
-private, is the spool writable, is the service running and enabled, is
-the update timer what the config says, and can the host reach WatchFor
-over TLS. Each answer that can be repaired safely says how, and *Repair
+check by hand: is `agent.yml` there and does it parse, is it (or its
+folder) writable by anyone but root or owned by another account — a
+failure, since whoever can change it can point `server.url` at their own
+server and receive the token —, is the binary
+writable by others, does the service user exist and does anything else
+run with its uid, is the token file private, is the spool writable, is
+the service running and enabled (and its unit this release's), do the
+service and a cron entry both run the agent, is the update timer what the
+config says, can the host reach WatchFor over TLS (with `server.ca_file`
+when set, as the agent does), and does WatchFor accept this host — the
+last push's answer: accepted, token rejected, paused by the plan, or no
+answer. A rejected-token record in the state folder is shown with what it
+says; one that no longer counts — for an earlier token, written for a plan
+pause, older than the token file, or left by an agent before 0.9 (which
+counted a plan pause as a dead token and stopped for good) — comes with a
+repair that removes it and starts the service if it had stopped over it.
+Each answer that can be repaired safely says how, and *Repair
 what can be repaired* applies all of them (chmod, chown, mkdir,
-`systemctl enable --now`).
+`systemctl enable --now`, moving the account to a free uid, removing the
+duplicate cron entry, installing this release's unit, removing a stale
+rejected-token record). After the agent
+stopped itself over a rejected token (exit 3) it offers no "start again"
+until the token has changed.
+
+When processes that are not the agent run with the agent's uid — usually
+a container without a user namespace whose service has the same number —
+the check names them and explains what that means: to the kernel they are
+one user, so they can read the agent's token and spool, the agent could
+signal them and read their `/proc/<pid>/environ`, and the unit's
+`RemoveIPC=` removes that uid's shared memory in the host namespace each
+time the agent stops. The repair (root) stops the service, gives the
+account and its group the first free id in 60578–61183 (`groupmod -g`,
+`usermod -u`), hands the config folder, the token and the state folder
+from the old ids to the new by descriptor, and starts the service again.
 
 Repairs run as root, so they are deliberately narrow: they touch only the
 installer's own paths (`/etc/watchfor-agent/agent.yml`, `…/token`,
@@ -371,7 +451,7 @@ modules:
     ignore_fs: [nfs, fuse.sshfs]            # skip filesystem types on top of the built-in pseudo-fs list
     io: false                               # no I/O rates at all
   network:
-    interfaces: [eth0]                      # only these (default: all but lo, veth*, docker*, br-*, virbr*)
+    interfaces: [eth0]                      # only these (default: all but loopback and container/VM/Kubernetes plumbing: veth*, docker*, br-*, virbr*, cali*, flannel*, cni*, lxc* …)
   processes:
     top: 5                                  # top CPU and memory consumers per batch
     watch:                                  # named processes: running or not, CPU, memory — alertable
@@ -446,9 +526,15 @@ Rules that hold for the whole file:
 - The token belongs in a file that must be mode 0600, or in an
   environment variable (`token: env:NAME`). A literal `token:` in
   agent.yml is accepted but the health check warns about it, and the
-  screen never shows it back. The token comes from a file that must be mode
-  0600, or from an environment variable. A world-readable token file is a
-  start-up error.
+  screen never shows it back. A world-readable token file is a start-up
+  error, and so is one that holds more than one line, characters no HTTP
+  header may carry, or is not a plain file (a FIFO or device is refused at
+  once instead of blocking; a symlink to a plain file is fine).
+- `run` and `once` refuse an `agent.yml` that others may write (group- or
+  world-writable), and a folder around it or around the token file that
+  others may write (unless it has the sticky bit, like `/tmp`): anyone who
+  can change the file can point `server.url` at their own server and
+  receive the token. `check` sends nothing and still runs.
 - `server.url` must be `https://` (plain `http://` is allowed for
   `localhost` only). `ca_file` pins a CA instead of the system store.
 - `interval` has a floor of 5 seconds. The server answers each batch with the
@@ -462,7 +548,22 @@ Rules that hold for the whole file:
 | `system` | `cpu.usage_pct`, `cpu.user_pct`, `cpu.system_pct`, `cpu.iowait_pct`, `cpu.steal_pct`, `cpu.idle_pct` (per core with `per_core: true`), `cpu.count`, `load.1/5/15`, `mem.total/used/available/free/cached/buffers_bytes`, `mem.used_pct`, `swap.total/used_bytes`, `swap.used_pct`, `sys.uptime_s`, `sys.procs_running/blocked`, `sys.context_switches_per_s`, `sys.forks_per_s` | `/proc/stat`, `/proc/meminfo`, `/proc/loadavg`, `/proc/uptime` |
 | `disk` | per mount `{mount, device, fs}`: `disk.total/used/free_bytes`, `disk.used_pct`, `disk.inodes_used_pct`; per whole disk `{device}`: `diskio.read/write_bytes_per_s`, `diskio.read/write_ops_per_s`, `diskio.util_pct`, `diskio.await_ms`, `diskio.in_progress` | `statfs(2)`, `/proc/self/mounts`, `/proc/diskstats` |
 | `network` | per interface `{if}`: `net.rx/tx_bytes_per_s`, `net.rx/tx_packets_per_s`, `net.rx/tx_errors_per_s`, `net.rx/tx_dropped_per_s`; `net.sockets_used`, `net.tcp_in_use`, `net.tcp_time_wait`, `net.tcp_orphan`, `net.udp_in_use` | `/proc/net/dev`, `/proc/net/sockstat` |
-| `processes` | `proc.total/running/sleeping/blocked/zombie/stopped`, `proc.threads`; top N `{pid, name, user}`: `proc.cpu_pct`, `proc.rss_bytes`; per watch `{watch}`: `procwatch.count`, `procwatch.cpu_pct`, `procwatch.rss_bytes`, `procwatch.uptime_s` | `/proc/<pid>/{stat,statm,status,cmdline}` |
+| `processes` | `proc.total/running/sleeping/blocked/zombie/stopped`, `proc.threads`; top N `{pid, name, user, container, self}`: `proc.cpu_pct`, `proc.rss_bytes`; per watch `{watch}`: `procwatch.count`, `procwatch.cpu_pct`, `procwatch.rss_bytes`, `procwatch.uptime_s` | `/proc/<pid>/{stat,statm,status,cmdline}` |
+
+`user` is the account name from this machine's `/etc/passwd` — except for
+a process in a container, where that name would belong to someone else
+(container uid 999 is host uid 999 without a user namespace): there `user`
+is the bare uid and `container` names the container as
+`<runtime>:<short id>` (`docker:3f2a9c1b7d4e`, `podman:…`, `containerd:…`,
+`cri-o:…`, `kubernetes:…`, `lxc:<name>`, `nspawn:<name>`), read from
+`/proc/<pid>/cgroup` and cached per process. `self="true"` marks the
+agent's own process. The cgroup is the signal rather than the pid
+namespace: browser sandboxes and flatpak have their own pid namespace too,
+yet their uid is a real host user.
+
+Every batch also carries what the agent itself costs: `agent.rss_bytes`,
+`agent.cpu_pct` (from the second sample on) and `agent.spool_batches`
+(batches waiting, when the spool is on).
 
 Rates need two samples, so the first tick after start reports gauges only;
 `once` takes two samples one second apart for the same reason.
@@ -510,13 +611,59 @@ That grants read access everywhere without running as root.
 Exit status 3 means the server has rejected the token repeatedly for over
 an hour (one rejection is spooled and retried with a growing backoff);
 the unit does not
-restart on it, because restarting would only repeat the rejection.
+restart on it, because restarting would only repeat the rejection. A
+start by hand (or a boot) always tries once more, `upgrade` starts a
+service that had stopped this way so the new release can look again, and
+a new token in `/etc/watchfor-agent/token` is picked up by a running agent
+within 30 seconds. A host WatchFor has paused because the plan does not
+take it (over the host limit) is not a dead token: the agent asks again
+after 1, 5, 15 and then every 30 minutes, keeps nothing meanwhile, and
+resumes by itself when the plan allows.
+
+The record behind exit 3 is `/var/lib/watchfor-agent/token-rejected`; it
+now keeps the server's reason. Agents up to 0.8 counted a plan pause in it
+too and stopped for good: this release removes a record written for a plan
+pause or older than the token file at start, and treats a record without a
+reason (0.8's) as unconfirmed — one more rejection is needed before it
+stops. A host 0.8 stopped that way starts again with the new release on
+`sudo systemctl restart watchfor-agent`, a re-run of the installer or a
+reboot (`health` offers the repair).
+
+Two guards keep the service from wedging. Only one agent runs per state
+folder: a second `run` (a manual one next to the service) waits up to 90
+seconds and then refuses with the reason. And a collection round that
+cannot be making progress any more — longer than two intervals plus ten
+minutes, say a module stuck on a dead NFS mount — ends the process with
+every goroutine's stack in the journal, and `Restart=always` starts a
+fresh one. A systemd watchdog would do the same, but a unit with
+`WatchdogSec=` and a binary that does not ping it (a downgrade keeps the
+newer unit) kill each other every few minutes, so the guard lives in the
+binary.
 
 ## When the server is unreachable
 
 Batches are written to `/var/lib/watchfor-agent` (up to `spool.max_mb`,
-oldest dropped first) and replayed after the next successful push. `once`
-uses the same directory, so a cron-driven host catches up on its next run.
+oldest dropped first — also when the disk is full, so the newest batches
+are kept) and replayed after the next successful push. Each replay request
+merges consecutive spooled batches up to 5000 samples, and a push makes as
+many replay requests as the server's per-host budget leaves (four at a
+one-minute interval), so a day offline at one batch a minute is sent in a
+few minutes, not hours. Spool files are numbered in sequence, not by the
+clock, so a clock stepped backwards neither drops the newest batch nor
+replays out of order. `once` uses the same directory, so a cron-driven
+host catches up on its next run.
+
+A batch never goes over ingest's per-request limits (10 000 samples,
+512 KiB compressed): a host with a thousand interfaces sends its batch in
+several requests of at most 5000 samples, and a `413` answer halves the
+request and sends the halves instead of dropping it. A redirect (`3xx`) is
+never followed — the token goes only where `agent.yml` says — but the batch
+is spooled and the log says where it pointed. While the server keeps failing (network, 429,
+5xx) the daemon asks less often: from the second failure in a row it
+waits the interval doubled per failure, up to five minutes, jittered so
+hosts that lost the server together do not return together; a
+`Retry-After` the server sends stands. Memory stays flat through an outage
+of any length — batches go to disk, never to a queue in memory.
 
 ## Wire format
 
@@ -572,10 +719,10 @@ gh attestation verify watchfor-agent_0.7.0_linux_amd64.tar.gz --repo watchfor-io
 
 | Code | Meaning |
 | --- | --- |
-| 0 | `once`/`check` finished; `run` stopped on SIGINT/SIGTERM |
-| 1 | configuration or runtime error (see the log) |
+| 0 | `once`/`check` finished (or `once` stepped aside for an agent already running); `run` stopped on SIGINT/SIGTERM |
+| 1 | configuration or runtime error (see the log); `once` whose batch was not accepted or that ran out of time; `run` refused because another agent runs, or ended by its stall guard |
 | 2 | the command line made no sense |
-| 3 | the server has rejected the token repeatedly for over an hour — revoked, rotated, or the plan has no server monitoring; a single rejection is spooled and retried; the unit does not restart on 3 |
+| 3 | the server has rejected the token repeatedly for over an hour — the host was removed or its token rotated; a single rejection is spooled and retried; the unit does not restart on 3 (a plan that does not take the host is never exit 3) |
 | 10 | `upgrade -check`: a newer release is available |
 | 1 (health) | `health`: at least one check failed |
 | 75 | `agent.yml` changed and validated; the daemon asks to be started again on the new file, which the unit does at once |

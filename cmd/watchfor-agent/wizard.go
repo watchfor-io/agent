@@ -728,8 +728,11 @@ func haveSystemctl() bool {
 	return err == nil
 }
 
+// execCmdCombined is every command the screen and the maintenance verbs
+// run: bounded, and the child reaped, even where the caller passes
+// context.Background().
 func execCmdCombined(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+	return update.Command(ctx, name, args...)
 }
 
 // runHome is `watchfor-agent` with no arguments on a terminal: the
