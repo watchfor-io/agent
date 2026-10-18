@@ -616,6 +616,19 @@ func reachable(ctx context.Context, o Options) Check {
 		}
 	}
 	start := time.Now()
+	if u.Scheme == "http" {
+		// plain http is allowed for a loopback ingest only (a local relay or
+		// a test server): no TLS to check, just the port
+		d := net.Dialer{Timeout: 5 * time.Second}
+		conn, err := d.DialContext(ctx, "tcp", host)
+		if err != nil {
+			c.State, c.Detail = Fail, fmt.Sprintf("cannot reach %s — %v", u.Host, err)
+			return c
+		}
+		_ = conn.Close()
+		c.State, c.Detail = OK, fmt.Sprintf("%s · plain http (loopback) in %s", u.Host, time.Since(start).Round(time.Millisecond))
+		return c
+	}
 	if err := o.Dial(ctx, "tcp", host); err != nil {
 		c.State = Fail
 		c.Detail = fmt.Sprintf("cannot reach %s — %v", u.Host, err)

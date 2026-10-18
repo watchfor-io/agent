@@ -5,8 +5,10 @@ package health
 import (
 	"context"
 	"encoding/pem"
+	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -319,5 +321,23 @@ func TestWritableConfigAndTokenFolderFail(t *testing.T) {
 	}
 	if c := tokenFile(o); c.State != Fail || c.Fix == nil {
 		t.Errorf("world-writable folder, token = %+v", c)
+	}
+}
+
+// A loopback http:// ingest (allowed by the config) is checked with a
+// plain connection, not a TLS handshake it can never pass.
+func TestReachablePlainHTTPLoopback(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	cfg, err := config.ParseText("server:\n  url: http://" + ln.Addr().String() + "\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := Options{Config: cfg, Dial: func(context.Context, string, string) error { return errors.New("TLS must not be tried") }}
+	if c := reachable(context.Background(), o); c.State != OK {
+		t.Errorf("loopback http = %+v", c)
 	}
 }
