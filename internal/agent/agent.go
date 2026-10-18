@@ -121,13 +121,29 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
-// applyAck stretches the cadence to the server's minimum. The configured
-// interval stays the floor, so a plan upgrade brings the agent back down
-// without a restart.
+// maxServerInterval caps how far the server may stretch the cadence. No
+// plan asks for more than a few minutes; a bad or hostile answer ("push
+// once a year") must not quietly turn the agent into a silent one.
+const maxServerInterval = time.Hour
+
+// serverInterval is the cadence the server asked for, clamped to
+// 0…maxServerInterval (in seconds first, so a huge value cannot overflow
+// time.Duration into a negative one).
+func serverInterval(seconds int) time.Duration {
+	return time.Duration(min(max(seconds, 0), int(maxServerInterval/time.Second))) * time.Second
+}
+
+// applyAck stretches the cadence to the server's minimum, capped at
+// maxServerInterval. The configured interval stays the floor, so a plan
+// upgrade brings the agent back down without a restart.
 func (a *Agent) applyAck(ack push.Ack) {
-	want := max(a.o.Interval, time.Duration(ack.Interval)*time.Second)
+	want := max(a.o.Interval, serverInterval(ack.Interval))
 	if want == a.interval {
 		return
+	}
+	if ack.Interval > int(maxServerInterval/time.Second) { // said once per change, not per push
+		a.o.Log.Warn("the server asked for a longer interval than the agent allows; using the cap",
+			"asked_s", ack.Interval, "cap", maxServerInterval.String())
 	}
 	if want > a.o.Interval {
 		a.o.Log.Info("interval set by the server", "interval", want.String(), "configured", a.o.Interval.String())

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/watchfor-io/agent/internal/safefile"
 )
 
 // StateFile is written by the running agent (into its state directory,
@@ -16,17 +18,15 @@ import (
 // opt-in update timer — never has to ask GitHub what is current.
 const StateFile = "update-available"
 
-// WriteState records that version is available. Atomic: a reader never
-// sees a half-written file.
+// WriteState records that version is available. Atomic (a reader never
+// sees a half-written file), and safe when root runs the daemon by hand:
+// the temp is a fresh O_EXCL file and the rename replaces whatever sits at
+// the name, so a symlink planted in the directory is never written through.
 func WriteState(dir, version string) error {
 	if dir == "" {
 		return errors.New("no state directory")
 	}
-	tmp := filepath.Join(dir, "."+StateFile+".tmp")
-	if err := os.WriteFile(tmp, []byte(version+"\n"), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(dir, StateFile))
+	return safefile.WriteAtomic(dir, StateFile, []byte(version+"\n"), 0o600)
 }
 
 // ClearState removes the hint; a missing file is not an error.

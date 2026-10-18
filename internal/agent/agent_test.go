@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"testing"
 	"time"
 
@@ -181,6 +182,37 @@ func TestModuleFailureLoggedOnce(t *testing.T) {
 	a.note("m", nil)
 	if len(a.failing) != 0 {
 		t.Error("recovery should clear the failure")
+	}
+}
+
+// A bad or hostile ingest cannot stretch the cadence past an hour (or
+// overflow it negative); the configured interval stays the floor.
+func TestServerIntervalIsClamped(t *testing.T) {
+	sink := &fakeSink{}
+	a := newAgent(t, sink, nil)
+	cases := []struct {
+		server int
+		want   time.Duration
+	}{
+		{365 * 24 * 3600, time.Hour},
+		{3600, time.Hour},
+		{3601, time.Hour},
+		{math.MaxInt, time.Hour},
+		{-5, a.o.Interval},
+		{0, a.o.Interval},
+		{120, 2 * time.Minute},
+	}
+	for _, c := range cases {
+		sink.interval = c.server
+		if err := a.Once(context.Background(), time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		if a.Interval() != c.want {
+			t.Errorf("server interval %d s: agent uses %s, want %s", c.server, a.Interval(), c.want)
+		}
+	}
+	if got := serverInterval(math.MaxInt); got != time.Hour {
+		t.Errorf("serverInterval(huge) = %s", got)
 	}
 }
 

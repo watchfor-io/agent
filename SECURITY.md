@@ -15,12 +15,26 @@ rewritten one.
 
 - Outbound HTTPS to one URL, `server.url`, with a bearer token. Nothing listens.
 - Reads `/proc`, `/sys` and mount usage. Runs nothing from configuration and
-  never accepts commands from the server — the server's whole answer to a
+  never accepts commands from the server. The server's whole answer to a
   batch is how many samples it kept, the shortest interval the plan allows
-  and the newest release version, a hint the agent only logs; it does not
-  otherwise accept commands from the server — the whole answer to a
-  batch is how many samples it kept and the shortest interval the account
-  allows.
+  (the agent never goes below its configured interval, and caps the
+  server's value at one hour) and the newest release version.
+- That version is a hint, not an instruction. The daemon logs it and writes
+  it to `update-available` in its state directory (`/var/lib/watchfor-agent`).
+  If the opt-in update timer is enabled (`install.sh --auto-update` or
+  `watchfor-agent auto-update on`), the root one-shot
+  `watchfor-agent-update.service` reads that file — without following
+  links, at most 64 bytes, only a well-formed version — and runs
+  `watchfor-agent upgrade -if-available`, which installs that version only
+  when it is newer than the running one and passes the same chain as a
+  manual upgrade (below): a `checksums.txt` signed by a key compiled into
+  the installed binary, a trusted comment naming that exact version, the
+  archive's sha256 matching the signed list, and the new binary reporting
+  the expected version before it atomically replaces the old one. Whoever
+  controls the server or the service account can therefore delay an
+  update or trigger an upgrade to a real, newer signed release — never
+  install anything unsigned or older. Without the timer the file only
+  feeds `watchfor-agent upgrade` run by hand.
 - The token comes from a file that must be mode 0600 or from an environment
   variable; it is never written to logs or to the spool.
 - The systemd unit runs as an unprivileged user with `ProtectSystem=strict`,

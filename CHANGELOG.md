@@ -3,6 +3,54 @@
 Releases are tagged `vX.Y.Z`; every tarball ships with a `checksums.txt`
 signed by the WatchFor release key. Dates are the day the tag was pushed.
 
+## Unreleased
+
+- **A hung network mount no longer silences the whole agent.** `statfs` on
+  a hard NFS/CIFS mount whose server has gone away blocks in the kernel,
+  and the disk module asked every mount in turn inside the collection
+  tick, so one dead mount stopped every metric from being reported. Each
+  mount is now asked with a 2-second limit (a few at a time); one that
+  does not answer is skipped, named in the module's error, and asked
+  again after five minutes, while the other disks and I/O rates keep
+  being reported. Stuck calls are never stacked: at most one per mount
+  point and 16 in all.
+- **The server can no longer stretch the push interval without limit.**
+  The interval the server returns was applied as is, so a faulty or
+  hostile answer could make an agent report once a year and look silent.
+  It is now capped at one hour (the configured interval is still the
+  floor), with a warning when the cap applies.
+- **Process names can no longer spoof labels with invisible Unicode.**
+  Control characters were already replaced, but bidi overrides and
+  isolates (U+202A–202E, U+2066–2069, U+200E/200F, U+061C), zero-width
+  characters (U+200B–200D, U+2060, U+FEFF) and the line/paragraph
+  separators passed through, so a process could make its name read as
+  another one on the screen or the dashboard. They are now shown as `�`.
+- **Cloud metadata requests ignore `HTTP(S)_PROXY`.** With a proxy in the
+  service environment, the instance-metadata requests (including the AWS
+  IMDSv2 session token) went through the proxy. They now always go
+  straight to the link-local address, with short connect and response
+  timeouts.
+- **Safer state and spool files when the agent runs as root.** The
+  update hint was written through a fixed temp name, so a symlink planted
+  in the state directory could make a root-run `run`/`once` overwrite
+  another file, and a FIFO or symlink planted in the spool could hang the
+  agent or make it upload a file it was pointed at. The hint is now
+  written to a fresh `O_EXCL` temp file, fsynced and renamed into place;
+  spool entries that are not plain, singly linked files are removed
+  instead of read, and batches are read without following links or
+  blocking.
+- **Release signing is isolated from the build.** GoReleaser is pinned to
+  an exact version (installed with `go install`, checked against the Go
+  checksum database) and no longer holds the signing key: it uploads an
+  unsigned draft, the binaries are reproduced from the tag on a fresh
+  runner, a separate approval-gated job that only receives the verified
+  `checksums.txt` and the key signs it, and the release is published only
+  after the signature has been checked with the key built into the tagged
+  agent. Build caches are off in all release jobs.
+- SECURITY.md now describes accurately what happens to the server's
+  newer-version hint: the opt-in root update unit acts on it, through the
+  full signature chain.
+
 ## 0.8.2 — 2026-10-15
 
 - **Built with Go 1.27.2.** 0.8.1 and earlier were compiled with Go 1.26.8,
