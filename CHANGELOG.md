@@ -3,7 +3,7 @@
 Releases are tagged `vX.Y.Z`; every tarball ships with a `checksums.txt`
 signed by the WatchFor release key. Dates are the day the tag was pushed.
 
-## Unreleased
+## 0.9.1 — 2026-11-19
 
 - **Built with Go 1.27.4.** The 0.9.0 binaries were built with Go 1.27.2,
   whose standard library has GO-2026-6809 (`crypto/x509`, fixed in 1.27.3)
