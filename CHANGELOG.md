@@ -3,6 +3,16 @@
 Releases are tagged `vX.Y.Z`; every tarball ships with a `checksums.txt`
 signed by the WatchFor release key. Dates are the day the tag was pushed.
 
+## Unreleased
+
+- **Built with Go 1.27.4.** The 0.9.0 binaries were built with Go 1.27.2,
+  whose standard library has GO-2026-6809 (`crypto/x509`, fixed in 1.27.3)
+  and GO-2026-6859 (`net/http`, fixed in 1.27.4); both are reachable from
+  the agent's HTTPS push client, so every binary needs a rebuild.
+- `golang.org/x/crypto` 0.59.0 (with `x/sys` 0.50.0 and `x/text` 0.44.0).
+- The "no token" startup error names the config file as a `config` field
+  instead of in the message text.
+
 ## 0.9.0 — 2026-10-18
 
 - **Hosts with many interfaces no longer lose their batches.** A host with
