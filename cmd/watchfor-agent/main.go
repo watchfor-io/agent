@@ -385,7 +385,7 @@ func loadRunConfig(cmd, path string) (*config.Config, error) {
 // exit code that explains why there cannot be one.
 func newSink(cfg *config.Config, configPath string, log *slog.Logger) (*push.Client, int) {
 	if !cfg.HasToken() {
-		log.Error("no token: set server.token_file (or server.token: env:NAME) in " + configPath)
+		log.Error("no token: set server.token_file (or server.token: env:NAME)", "config", configPath)
 		return nil, exitError
 	}
 	if cfg.Server.URL == "" {
